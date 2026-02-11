@@ -5,10 +5,40 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Python Debugger: Module",
+            "name": "Web App (port 8080)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "job_agent.webapp",
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
+            "name": "API Server (port 8088)",
             "type": "debugpy",
             "request": "launch",
             "module": "job_agent.server"
+        },
+        {
+            "name": "Debug: CLI Test",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/test_cli.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            }
+        },
+        {
+            "name": "Debug: E2E Tests",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/test_e2e.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            }
         }
     ]
 }

@@ -2,18 +2,36 @@
 """Interactive CLI for testing the job agent locally."""
 
 import asyncio
+import logging
 import sys
 from pathlib import Path
 
 # Add src to path for local testing
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
+# Enable agent tracing — shows classifier decisions, routing, and tool calls
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(message)s",
+)
+# Show our workflow traces but keep framework/OpenAI noise quiet
+logging.getLogger("job_agent.workflows").setLevel(logging.INFO)
+
+# --- OpenTelemetry ---
+# Agent Framework has built-in OTel support.  Set env vars to control:
+#   ENABLE_INSTRUMENTATION=true        → emit spans for invoke_agent, chat, execute_tool
+#   ENABLE_SENSITIVE_DATA=true          → include prompts/responses in span attributes
+#   OTEL_EXPORTER_OTLP_ENDPOINT=...    → send to Aspire Dashboard / Jaeger / etc.
+#   ENABLE_CONSOLE_EXPORTERS=true       → print spans to console (noisy but useful)
+from dotenv import load_dotenv
+load_dotenv()
+
+from agent_framework.observability import configure_otel_providers
+configure_otel_providers()   # reads OTEL_* and ENABLE_* from env/.env
+
 from job_agent.clients import build_azure_openai_client
 from job_agent.config import AppConfig
-from job_agent.providers import get_job_provider
-from job_agent.ranking import get_ranking_service
-from job_agent.store import InMemoryJobStore, get_store
-from job_agent.workflows import CoordinatorExecutor
+from job_agent.workflows import create_agent
 
 
 async def main():
@@ -43,27 +61,13 @@ async def main():
         print("  AZURE_OPENAI_DEPLOYMENT_NAME=gpt-4o")
         return
     
-    # Build components
-    print("\nInitializing...")
+    # Build agent using the async factory (handles DB init)
+    print("\nInitializing multi-agent workflow...")
     client = build_azure_openai_client(config.azure_openai)
+    use_database = bool(config.database and config.database.is_configured)
+    agent, _store, _ranking = await create_agent(client, use_database=use_database)
     
-    # Use PostgreSQL if configured, otherwise in-memory
-    if config.database and config.database.is_configured:
-        store = await get_store(config.database)
-    else:
-        store = InMemoryJobStore()
-    
-    provider = get_job_provider(config.serpapi.api_key)
-    ranking_service = get_ranking_service(config.azure_openai)
-    
-    executor = CoordinatorExecutor(
-        client=client,
-        store=store,
-        provider=provider,
-        ranking_service=ranking_service,
-    )
-    
-    print("✓ Agent ready!\n")
+    print("✓ Agent ready! (Coordinator → JobSearch + AppPrep)\n")
     print("Commands:")
     print("  - Type your message and press Enter")
     print("  - Type 'quit' or 'exit' to stop")
@@ -110,7 +114,7 @@ async def main():
         
         # Get response from agent
         try:
-            response = await executor.agent.run(conversation)
+            response = await agent.run(conversation)
             assistant_text = response.text or "(No response)"
             
             # Add assistant response to conversation for context

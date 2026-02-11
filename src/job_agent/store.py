@@ -64,7 +64,11 @@ class JobStore(ABC):
     async def get_default_profile(self) -> Optional[UserProfile]:
         """Get the default/most recent user profile."""
         return None
-    
+
+    async def list_profiles(self) -> list[UserProfile]:
+        """List all user profiles, most recently updated first."""
+        return []
+
     async def update_job_embeddings(self, job_embeddings: list[tuple[str, list[float]]]) -> int:
         """Update embeddings for multiple jobs. Returns count of updated jobs."""
         return 0
@@ -191,7 +195,13 @@ class InMemoryJobStore(JobStore):
         if self._default_profile_id:
             return self._profiles.get(self._default_profile_id)
         return None
-    
+
+    async def list_profiles(self) -> list[UserProfile]:
+        """List all user profiles, most recently updated first."""
+        profiles = list(self._profiles.values())
+        profiles.sort(key=lambda p: p.updated_at, reverse=True)
+        return profiles
+
     async def update_job_embeddings(self, job_embeddings: list[tuple[str, list[float]]]) -> int:
         """Update embeddings for multiple jobs."""
         count = 0
@@ -619,7 +629,15 @@ class PostgresJobStore(JobStore):
         if row:
             return self._row_to_profile(row)
         return None
-    
+
+    async def list_profiles(self) -> list[UserProfile]:
+        """List all user profiles, most recently updated first."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM user_profiles ORDER BY updated_at DESC LIMIT 50"
+            )
+        return [self._row_to_profile(row) for row in rows]
+
     # Feedback methods
     async def save_feedback(self, feedback: JobFeedback) -> JobFeedback:
         """Save user feedback on a job."""

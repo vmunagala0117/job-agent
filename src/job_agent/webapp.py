@@ -1,0 +1,464 @@
+"""FastAPI web application for the Job Agent.
+
+Serves a clean chat UI and exposes a REST API for the multi-agent workflow.
+Designed for deployment to Azure Web App or Azure Container App.
+
+Usage:
+    uvicorn job_agent.webapp:app --host 0.0.0.0 --port 8080
+
+Or via the CLI entry point:
+    python -m job_agent.webapp
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import logging
+import os
+import time
+import uuid
+from collections import deque
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+from agent_framework import ChatMessage, Role, TextContent
+
+from .clients import build_azure_openai_client
+from .config import AppConfig
+from .workflows import create_agent
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Trace buffer — captures [TRACE] logs per session for the UI panel
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TraceEntry:
+    """A single trace log line."""
+    timestamp: float
+    level: str
+    message: str
+
+
+class SessionTraceHandler(logging.Handler):
+    """Logging handler that captures [TRACE] lines into per-session buffers."""
+
+    def __init__(self, max_entries: int = 200):
+        super().__init__()
+        self._buffers: dict[str, deque[TraceEntry]] = {}
+        self._max = max_entries
+        self._active_session: str | None = None
+
+    def set_session(self, session_id: str) -> None:
+        self._active_session = session_id
+        if session_id not in self._buffers:
+            self._buffers[session_id] = deque(maxlen=self._max)
+
+    def clear_session(self, session_id: str) -> None:
+        self._buffers.pop(session_id, None)
+
+    def get_traces(self, session_id: str) -> list[dict]:
+        buf = self._buffers.get(session_id, [])
+        return [
+            {"timestamp": e.timestamp, "level": e.level, "message": e.message}
+            for e in buf
+        ]
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if self._active_session is None:
+            return
+        msg = self.format(record)
+        entry = TraceEntry(
+            timestamp=record.created,
+            level=record.levelname,
+            message=msg,
+        )
+        buf = self._buffers.get(self._active_session)
+        if buf is not None:
+            buf.append(entry)
+
+
+# Global trace handler — installed once at startup
+_trace_handler = SessionTraceHandler()
+
+
+# ---------------------------------------------------------------------------
+# Session management (in-memory — swap for Redis on multi-instance Azure)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ChatSession:
+    """Maintains conversation history for one chat session."""
+    id: str
+    messages: list[ChatMessage] = field(default_factory=list)
+    resume_filename: str | None = None
+
+
+_sessions: dict[str, ChatSession] = {}
+_agent: Any = None  # Populated during lifespan startup
+_services: dict[str, Any] = {}  # Shared services for resume upload
+
+
+def _get_or_create_session(session_id: str | None) -> ChatSession:
+    """Return existing session or create a new one."""
+    if session_id and session_id in _sessions:
+        return _sessions[session_id]
+    new_id = session_id or str(uuid.uuid4())
+    session = ChatSession(id=new_id)
+    _sessions[new_id] = session
+    return session
+
+
+# ---------------------------------------------------------------------------
+# Request / Response models
+# ---------------------------------------------------------------------------
+
+class ChatRequest(BaseModel):
+    message: str
+    session_id: str | None = None
+
+
+class ChatResponse(BaseModel):
+    response: str
+    session_id: str
+    traces: list[dict] = []
+
+
+class HealthResponse(BaseModel):
+    status: str
+    agent_ready: bool
+
+
+class SessionInfo(BaseModel):
+    session_id: str
+    message_count: int
+
+
+class UploadResponse(BaseModel):
+    status: str
+    filename: str
+    summary: str
+    session_id: str
+
+
+# ---------------------------------------------------------------------------
+# Application lifespan — initialise agent once at startup
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Start up: configure telemetry, build the multi-agent workflow. Shut down: clean up."""
+    global _agent
+
+    # --- Install trace handler for UI panel ---
+    wf_logger = logging.getLogger("job_agent.workflows")
+    _trace_handler.setFormatter(logging.Formatter("%(message)s"))
+    wf_logger.addHandler(_trace_handler)
+    wf_logger.setLevel(logging.INFO)
+
+    # --- OpenTelemetry ---
+    from agent_framework.observability import configure_otel_providers
+    configure_otel_providers()
+    logger.info("OpenTelemetry configured")
+
+    logger.info("Initialising Job Agent...")
+    config = AppConfig.load()
+    client = build_azure_openai_client(config.azure_openai)
+    use_db = bool(config.database and config.database.is_configured)
+
+    # create_agent now returns (agent, store, ranking_svc) — single set of services
+    _agent, store, ranking_svc = await create_agent(client, use_database=use_db)
+    _services["store"] = store
+    _services["ranking"] = ranking_svc
+
+    # --- Auto-load default profile from database ---
+    from .tools import set_current_profile
+    try:
+        default_profile = await store.get_default_profile()
+        if default_profile:
+            set_current_profile(default_profile)
+            logger.info("Auto-loaded profile: %s", default_profile.name)
+        else:
+            logger.info("No saved profiles found — upload one to get started")
+    except Exception as exc:
+        logger.warning("Could not auto-load profile: %s", exc)
+
+    logger.info("Job Agent ready ✓")
+    yield
+    logger.info("Shutting down Job Agent")
+
+
+# ---------------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------------
+
+STATIC_DIR = Path(__file__).parent / "static"
+
+app = FastAPI(
+    title="Job Agent",
+    description="AI-powered job search and application preparation assistant",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+# Mount static assets (CSS, JS, images)
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+@app.get("/", response_class=FileResponse)
+async def index():
+    """Serve the chat UI."""
+    return FileResponse(str(STATIC_DIR / "index.html"))
+
+
+@app.get("/health", response_model=HealthResponse)
+async def health():
+    """Health check endpoint for Azure load balancer / readiness probe."""
+    return HealthResponse(status="ok", agent_ready=_agent is not None)
+
+
+@app.post("/api/chat", response_model=ChatResponse)
+async def chat(req: ChatRequest):
+    """Send a message to the agent and get a response."""
+    if _agent is None:
+        raise HTTPException(status_code=503, detail="Agent not ready")
+
+    if not req.message.strip():
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+
+    session = _get_or_create_session(req.session_id)
+
+    # Point the trace handler at this session
+    _trace_handler.set_session(session.id)
+
+    # Append user message
+    session.messages.append(
+        ChatMessage(role=Role.USER, contents=[TextContent(text=req.message)])
+    )
+
+    try:
+        response = await _agent.run(session.messages)
+        assistant_text = response.text or "(No response)"
+
+        # Append assistant message
+        session.messages.append(
+            ChatMessage(role=Role.ASSISTANT, contents=[TextContent(text=assistant_text)])
+        )
+
+        # Collect traces captured during this request
+        traces = _trace_handler.get_traces(session.id)
+
+        return ChatResponse(
+            response=assistant_text,
+            session_id=session.id,
+            traces=traces,
+        )
+
+    except Exception as exc:
+        logger.exception("Agent error")
+        session.messages.pop()
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/upload-resume", response_model=UploadResponse)
+async def upload_resume(
+    file: UploadFile = File(...),
+    session_id: str | None = None,
+):
+    """Upload and parse a resume file (PDF, DOCX, TXT).
+
+    Creates a user profile with embeddings for job matching.
+    """
+    if _agent is None:
+        raise HTTPException(status_code=503, detail="Agent not ready")
+
+    # Validate file type
+    filename = file.filename or "resume"
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if ext not in ("pdf", "docx", "txt"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '.{ext}'. Use PDF, DOCX, or TXT.",
+        )
+
+    session = _get_or_create_session(session_id)
+    _trace_handler.set_session(session.id)
+
+    try:
+        # Read and base64-encode for the parser
+        file_bytes = await file.read()
+        file_b64 = base64.b64encode(file_bytes).decode("ascii")
+
+        # Use ResumeParser directly (same path as the agent's upload_resume tool)
+        from .resume_parser import ResumeParser
+        from .tools import set_current_profile
+
+        parser = ResumeParser()
+        parsed = await parser.parse_and_extract(
+            file_data=file_b64,
+            file_type=ext,
+            use_llm=False,
+        )
+
+        profile = parsed.to_user_profile()
+
+        # Embed the profile for ranking
+        ranking_svc = _services.get("ranking")
+        if ranking_svc:
+            profile = await ranking_svc.embed_user_profile(profile)
+
+        # Set as current profile and persist
+        set_current_profile(profile)
+        store = _services.get("store")
+        if store:
+            await store.save_profile(profile)
+
+        session.resume_filename = filename
+
+        # Inject a system note into the conversation so the agent knows
+        summary_parts = []
+        if parsed.name:
+            summary_parts.append(f"Name: {parsed.name}")
+        if parsed.current_title:
+            summary_parts.append(f"Title: {parsed.current_title}")
+        if parsed.years_experience:
+            summary_parts.append(f"Experience: {parsed.years_experience} years")
+        skills = ", ".join(parsed.skills[:12])
+        if parsed.skills:
+            summary_parts.append(f"Skills: {skills}")
+
+        summary = "\n".join(summary_parts)
+
+        # Add to conversation so agent has context
+        session.messages.append(
+            ChatMessage(
+                role=Role.USER,
+                contents=[TextContent(text=f"[System: User uploaded resume '{filename}'. Parsed profile:\n{summary}]")],
+            )
+        )
+        session.messages.append(
+            ChatMessage(
+                role=Role.ASSISTANT,
+                contents=[TextContent(text=f"Resume parsed successfully! I've loaded your profile. {summary}")],
+            )
+        )
+
+        return UploadResponse(
+            status="ok",
+            filename=filename,
+            summary=summary,
+            session_id=session.id,
+        )
+
+    except Exception as exc:
+        logger.exception("Resume upload error")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/traces")
+async def get_traces(session_id: str):
+    """Return trace log entries for a session."""
+    return _trace_handler.get_traces(session_id)
+
+
+@app.get("/api/profiles")
+async def list_profiles():
+    """List all saved user profiles for the dropdown selector."""
+    store = _services.get("store")
+    if not store:
+        return []
+    try:
+        profiles = await store.list_profiles()
+        from .tools import get_current_profile
+        current = get_current_profile()
+        current_id = current.id if current else None
+        return [
+            {
+                "id": p.id,
+                "name": p.name or "Unnamed",
+                "title": p.current_title or "",
+                "skills_count": len(p.skills),
+                "updated_at": p.updated_at.isoformat() if p.updated_at else "",
+                "is_active": p.id == current_id,
+            }
+            for p in profiles
+        ]
+    except Exception as exc:
+        logger.exception("Failed to list profiles")
+        return []
+
+
+@app.post("/api/profiles/select")
+async def select_profile(profile_id: str):
+    """Activate a saved profile by ID."""
+    store = _services.get("store")
+    if not store:
+        raise HTTPException(status_code=503, detail="Store not available")
+
+    profile = await store.get_profile(profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+
+    from .tools import set_current_profile
+    set_current_profile(profile)
+    logger.info("Switched to profile: %s", profile.name)
+
+    return {
+        "status": "ok",
+        "name": profile.name,
+        "title": profile.current_title or "",
+        "skills": profile.skills[:12],
+    }
+
+
+@app.post("/api/chat/reset", response_model=SessionInfo)
+async def reset_session(req: ChatRequest):
+    """Clear conversation history, traces, and start fresh."""
+    session_id = req.session_id
+    if session_id and session_id in _sessions:
+        del _sessions[session_id]
+        _trace_handler.clear_session(session_id)
+    new_session = _get_or_create_session(None)
+    return SessionInfo(session_id=new_session.id, message_count=0)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    """Run the web application with uvicorn."""
+    import uvicorn
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+    )
+    # Show agent traces
+    logging.getLogger("job_agent.workflows").setLevel(logging.INFO)
+
+    uvicorn.run(
+        "job_agent.webapp:app",
+        host="0.0.0.0",
+        port=8080,
+        reload=False,
+        log_level="info",
+    )
+
+
+if __name__ == "__main__":
+    main()

@@ -1,40 +1,124 @@
-# Job Agent (Azure Agent Framework)
+# Job Agent — Dual-Agent Job Search System
 
-A production-intent job search assistant using Microsoft Agent Framework. It exposes an HTTP-hosted agent that can search for jobs (via SerpAPI/Google Jobs), rank them against your resume using embeddings, and help manage your application workflow.
-
-## Features
-
-- **Job Search**: Search for jobs using SerpAPI's Google Jobs API (aggregates LinkedIn, Indeed, Glassdoor, etc.)
-- **Resume Parsing**: Upload PDF/DOCX resumes to auto-extract skills, experience, and create embeddings
-- **Resume-Based Ranking**: Get jobs ranked by fit using Azure OpenAI embeddings and skill matching
-- **Job Management**: Track job status (new, applied, rejected, interviewing)
-- **Persistent Storage**: PostgreSQL with pgvector for job and profile persistence
-- **Conversational Interface**: Natural language interaction with the agent
+A production-intent job search system using **Microsoft Agent Framework** with a multi-agent orchestration pattern. A **Coordinator** routes requests to two specialist agents: a **Job Search Agent** for finding and ranking jobs, and an **Application Prep Agent** for generating tailored application materials.
 
 ## Architecture
 
 ```
+User Request
+     │
+     ▼
+┌──────────────────────────────────────────────┐
+│           CoordinatorExecutor                 │
+│                                              │
+│  ┌────────────────────────────────────────┐  │
+│  │  Classifier (lightweight LLM call)     │  │
+│  │  → outputs JOB_SEARCH or APP_PREP      │  │
+│  └──────────┬───────────────┬─────────────┘  │
+│             │               │                │
+│      JOB_SEARCH        APP_PREP              │
+│             │               │                │
+│             ▼               ▼                │
+│  ┌─────────────────┐ ┌───────────────────┐   │
+│  │ Job Search Agent │ │ App Prep Agent    │   │
+│  │ (11 tools)       │ │ (3 tools)         │   │
+│  │ • search_jobs    │ │ • analyze_job_fit │   │
+│  │ • list_saved     │ │ • prepare_app     │   │
+│  │ • get_details    │ │ • get_package     │   │
+│  │ • rank_saved     │ └───────────────────┘   │
+│  │ • set_profile    │                         │
+│  │ • upload_resume  │                         │
+│  │ • send_notifs    │                         │
+│  │ • feedback       │                         │
+│  │ • mark_applied   │                         │
+│  │ • mark_rejected  │                         │
+│  │ • get_profile    │                         │
+│  └─────────────────┘                          │
+└──────────────────────────────────────────────┘
+         │                      │
+         ▼                      ▼
+┌──────────────────────────────────────────────┐
+│              Shared Services                  │
+│  • JobStore (PostgreSQL + pgvector)           │
+│  • RankingService (embeddings + heuristics)   │
+│  • EmbeddingService (text-embedding-3-small)  │
+│  • NotificationService (email/Teams/Slack)    │
+│  • ResumeParser (PDF/DOCX extraction)         │
+│  • Azure OpenAI (gpt-5.2 for reasoning)       │
+└──────────────────────────────────────────────┘
+```
+
+### Routing Pattern
+
+The system uses a **classifier-based routing** pattern inside a `CoordinatorExecutor`:
+- **Intent classification**: A lightweight LLM call classifies each request as `JOB_SEARCH` or `APP_PREP`
+- **Programmatic delegation**: The coordinator runs the appropriate specialist agent's `.run()` method
+- **Full conversation history**: Each specialist sees the complete chat context
+- **WorkflowBuilder**: Single-node executor wrapping the multi-agent logic, served via `from_agent_framework()`
+
+### Data Flow
+
+```
+1. SEARCH FLOW:
+   User → Coordinator → Job Search Agent
+   Job Search Agent:
+     fetch_jobs(SerpAPI) → embed_jobs(Azure OpenAI) → store(PostgreSQL)
+     rank_jobs(cosine similarity + heuristics) → notify(console/email/Teams/Slack)
+   
+2. APPLICATION PREP FLOW:
+   User → Coordinator → Application Prep Agent
+   Application Prep Agent:
+     load_job + load_profile → analyze_fit(LLM)
+     → generate_resume_diff(LLM) → generate_cover_letter(LLM)
+     → find_recruiters(Proxycurl API) → generate_intro_email(LLM)
+     → package & store(PostgreSQL)
+```
+
+## Features
+
+- **Multi-Agent Orchestration**: Coordinator (classifier) + Job Search Agent (11 tools) + App Prep Agent (3 tools)
+- **Job Search**: SerpAPI Google Jobs API (aggregates LinkedIn, Indeed, Glassdoor, etc.)
+- **Resume Parsing**: Upload PDF/DOCX resumes — auto-extracts skills, experience, creates embeddings
+- **Embedding-Based Ranking**: Jobs ranked by fit using Azure OpenAI embeddings + heuristic boosts
+- **Notifications**: Deliver top matches via console, email, Teams, or Slack
+- **Feedback Loop**: Capture user feedback (good fit, not relevant, tailor resume, etc.)
+- **Application Prep**: LLM-generated resume diff suggestions, cover letters, intro emails
+- **Recruiter Search**: Find relevant recruiters at target companies (Proxycurl API)
+- **Persistent Storage**: PostgreSQL + pgvector for jobs, profiles, feedback, application packages
+- **Conversational Interface**: Natural language interaction via HTTP-hosted agent
+
+## Project Structure
+
+```
 src/job_agent/
-├── config.py        # Configuration (Azure OpenAI, SerpAPI, PostgreSQL)
-├── clients.py       # Azure OpenAI client factory
-├── models.py        # Data models (Job, UserProfile, RankedJob)
-├── store.py         # Job storage (InMemoryJobStore, PostgresJobStore)
-├── providers.py     # Job ingestion (SerpAPI, Mock)
-├── ranking.py       # Embedding-based job ranking service
-├── resume_parser.py # PDF/DOCX resume parsing and skill extraction
-├── tools.py         # Agent tools (search, rank, manage)
-├── workflows.py     # Agent workflow and coordinator
-└── server.py        # HTTP server entry point
+├── config.py            # Configuration (Azure OpenAI, SerpAPI, PostgreSQL)
+├── clients.py           # Azure OpenAI client factory
+├── models.py            # Data models (Job, UserProfile, RankedJob, ApplicationPackage)
+├── store.py             # Storage (InMemoryJobStore, PostgresJobStore with pgvector)
+├── providers.py         # Job ingestion (SerpAPI, Mock)
+├── ranking.py           # Embedding + heuristic ranking service
+├── resume_parser.py     # PDF/DOCX resume parsing and skill extraction
+├── notifications.py     # Notification delivery (email, Teams, Slack, console)
+├── application_prep.py  # Application material generation service
+├── tools.py             # Shared profile state
+├── workflows.py         # Multi-agent workflow (Coordinator + Specialists)
+└── server.py            # HTTP server entry point
 
 scripts/
-└── init_db.py     # Database initialization script
+├── init_db.py           # Database schema initialization
+├── test_e2e.py          # End-to-end integration test (6 stages)
+├── test_cli.py          # Interactive CLI test
+├── test_routing.py      # Multi-agent routing test (3 scenarios)
+├── test_workflow.py     # Workflow smoke test
+└── test_notifications.py # Notification/feedback/prep test
 ```
 
 ## Prerequisites
-- Python 3.10+ (tested with 3.14)
+- Python 3.10+ (tested with 3.13)
 - Azure subscription with Azure OpenAI deployment (chat model + embeddings model)
-- SerpAPI account (optional, for real job data)
-- Auth: `az login` for `DefaultAzureCredential` or configure a service principal
+- PostgreSQL with pgvector (for persistent storage — falls back to in-memory)
+- SerpAPI account (optional, for real job data — falls back to mock)
+- Auth: `az login` for `DefaultAzureCredential` or configure API key
 
 ## Setup
 
@@ -225,7 +309,11 @@ For production, use Azure Database for PostgreSQL Flexible Server:
 
 - [x] Persistent storage (PostgreSQL + pgvector)
 - [x] Resume parsing (PDF/DOCX with skill extraction)
-- [ ] Application-prep agent (resume tailoring, cover letters)
-- [ ] Notification delivery (email/Slack/Teams)
-- [ ] Scheduled job ingestion
-- [ ] Evaluation and tracing
+- [x] Embedding-based job ranking with heuristic boosts
+- [x] Notification delivery (email/Teams/Slack/console)
+- [x] User feedback loop (good fit, not relevant, tailor resume)
+- [x] Application-prep service (resume diff, cover letters, intro emails)
+- [x] Multi-agent orchestration (Coordinator → Job Search + App Prep via classifier routing)
+- [ ] Scheduled job ingestion (cron-based auto-search)
+- [ ] Evaluation and tracing (pytest-agent-evals)
+- [ ] Recruiter search integration (Proxycurl API)

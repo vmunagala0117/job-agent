@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Job Agent</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <!-- Markdown rendering -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.1/marked.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+</head>
+<body>
+    <div class="app">
+        <!-- Header -->
+        <header class="header">
+            <div class="header-left">
+                <div class="logo">
+                    <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <rect x="2" y="7" width="20" height="14" rx="2" ry="2"/>
+                        <path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/>
+                    </svg>
+                </div>
+                <div>
+                    <h1>Job Agent</h1>
+                    <span class="subtitle">AI-powered job search &amp; application assistant</span>
+                </div>
+            </div>
+            <div class="header-center">
+                <!-- Profile selector dropdown -->
+                <div class="profile-selector">
+                    <label for="profile-select" class="profile-label">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+                            <circle cx="12" cy="7" r="4"/>
+                        </svg>
+                    </label>
+                    <select id="profile-select" title="Select a user profile">
+                        <option value="">No profile loaded</option>
+                    </select>
+                </div>
+                <!-- Resume badge (shown after upload) -->
+                <div id="resume-badge" class="resume-badge" hidden>
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                        <polyline points="14 2 14 8 20 8"/>
+                    </svg>
+                    <span id="resume-name">resume.pdf</span>
+                    <span class="badge-check">✓</span>
+                </div>
+            </div>
+            <div class="header-right">
+                <button id="traces-btn" class="btn btn-secondary" title="Toggle trace panel">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <polyline points="4 17 10 11 4 5"/>
+                        <line x1="12" y1="19" x2="20" y2="19"/>
+                    </svg>
+                    Traces
+                </button>
+                <button id="new-chat-btn" class="btn btn-secondary" title="New conversation">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <line x1="12" y1="5" x2="12" y2="19"/>
+                        <line x1="5" y1="12" x2="19" y2="12"/>
+                    </svg>
+                    New Chat
+                </button>
+            </div>
+        </header>
+
+        <!-- Content wrapper: chat + trace panel -->
+        <div class="content-wrapper">
+            <!-- Chat area -->
+            <main class="chat-container" id="chat-container">
+                <!-- Welcome message -->
+                <div class="welcome" id="welcome">
+                    <div class="welcome-icon">
+                        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                            <rect x="2" y="7" width="20" height="14" rx="2" ry="2"/>
+                            <path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/>
+                        </svg>
+                    </div>
+                    <h2>Welcome to Job Agent</h2>
+                    <p>I can help you search for jobs, manage applications, and prepare cover letters and resumes.</p>
+                    <div class="quick-actions">
+                        <button class="chip" data-message="Search for Python developer jobs in Seattle">
+                            🔍 Search Python jobs in Seattle
+                        </button>
+                        <button class="chip" data-message="Find remote machine learning engineer positions">
+                            🌐 Remote ML Engineer roles
+                        </button>
+                        <button class="chip" data-message="Set my profile: I have 5 years experience with Python, AWS, and Docker. I prefer remote work and I'm looking for senior-level positions.">
+                            👤 Set up my profile
+                        </button>
+                        <button class="chip" data-message="Help me prepare a cover letter for a software engineering position">
+                            📝 Prepare a cover letter
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Messages will be inserted here -->
+                <div id="messages"></div>
+
+                <!-- Typing indicator -->
+                <div class="typing-indicator" id="typing" style="display: none;">
+                    <div class="message assistant">
+                        <div class="message-avatar">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <rect x="2" y="7" width="20" height="14" rx="2" ry="2"/>
+                                <path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/>
+                            </svg>
+                        </div>
+                        <div class="message-content">
+                            <div class="dots">
+                                <span></span><span></span><span></span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </main>
+
+            <!-- Trace side panel -->
+            <aside class="trace-panel" id="trace-panel">
+                <div class="trace-header">
+                    <h3>Traces</h3>
+                    <button id="trace-clear-btn" class="btn-icon" title="Clear traces">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <polyline points="3 6 5 6 21 6"/>
+                            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                        </svg>
+                    </button>
+                </div>
+                <div class="trace-entries" id="trace-entries">
+                    <div class="trace-empty">No traces yet. Send a message to see agent activity.</div>
+                </div>
+            </aside>
+        </div>
+
+        <!-- Input area -->
+        <footer class="input-area">
+            <input type="file" id="file-input" accept=".pdf,.docx,.txt" hidden>
+            <form id="chat-form" class="input-form">
+                <div class="input-wrapper">
+                    <button type="button" id="upload-btn" class="btn-icon" title="Upload resume (PDF, DOCX, TXT)">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.49"/>
+                        </svg>
+                    </button>
+                    <textarea
+                        id="message-input"
+                        placeholder="Ask me about job searches, applications, or career advice..."
+                        rows="1"
+                        autofocus
+                    ></textarea>
+                    <button type="submit" id="send-btn" class="btn btn-primary" disabled>
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <line x1="22" y1="2" x2="11" y2="13"/>
+                            <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                        </svg>
+                    </button>
+                </div>
+                <div class="input-hint">
+                    Press <kbd>Enter</kbd> to send, <kbd>Shift+Enter</kbd> for new line
+                </div>
+            </form>
+        </footer>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

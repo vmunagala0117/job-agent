@@ -13,7 +13,8 @@ async def _create_agent():
     """Async helper to create the agent with database connection."""
     config = AppConfig.load()
     client = build_azure_openai_client(config.azure_openai)
-    return await create_agent(client, use_database=True)
+    agent, _store, _ranking = await create_agent(client, use_database=True)
+    return agent
 
 
 def main() -> None:
