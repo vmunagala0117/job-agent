@@ -132,6 +132,29 @@ async def init_database():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+            
+            -- Feedback table for user feedback on job matches
+            CREATE TABLE IF NOT EXISTS feedback (
+                id VARCHAR(36) PRIMARY KEY,
+                job_id VARCHAR(36) REFERENCES jobs(id) ON DELETE CASCADE,
+                feedback_type VARCHAR(50) NOT NULL,
+                notes TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            
+            -- Application packages table for prepared application materials
+            CREATE TABLE IF NOT EXISTS application_packages (
+                id VARCHAR(36) PRIMARY KEY,
+                job_id VARCHAR(36) REFERENCES jobs(id) ON DELETE CASCADE,
+                profile_id VARCHAR(36) REFERENCES user_profiles(id) ON DELETE CASCADE,
+                resume_suggestions JSONB,
+                cover_letter TEXT,
+                intro_email TEXT,
+                recruiters JSONB DEFAULT '[]',
+                status VARCHAR(50) DEFAULT 'draft',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
         """)
         
         print("Creating indexes...")
@@ -145,6 +168,17 @@ async def init_database():
             -- Full-text search index
             CREATE INDEX IF NOT EXISTS idx_jobs_search ON jobs 
                 USING GIN (to_tsvector('english', title || ' ' || company || ' ' || description));
+            
+            -- Feedback indexes
+            CREATE INDEX IF NOT EXISTS idx_feedback_job_id ON feedback(job_id);
+            CREATE INDEX IF NOT EXISTS idx_feedback_type ON feedback(feedback_type);
+            CREATE INDEX IF NOT EXISTS idx_feedback_created_at ON feedback(created_at DESC);
+            
+            -- Application packages indexes
+            CREATE INDEX IF NOT EXISTS idx_packages_job_id ON application_packages(job_id);
+            CREATE INDEX IF NOT EXISTS idx_packages_profile_id ON application_packages(profile_id);
+            CREATE INDEX IF NOT EXISTS idx_packages_status ON application_packages(status);
+            CREATE INDEX IF NOT EXISTS idx_packages_created_at ON application_packages(created_at DESC);
         """)
         
         # Create vector index only if there are jobs with embeddings

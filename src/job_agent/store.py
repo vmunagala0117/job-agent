@@ -620,6 +620,119 @@ class PostgresJobStore(JobStore):
             return self._row_to_profile(row)
         return None
     
+    # Feedback methods
+    async def save_feedback(self, feedback: JobFeedback) -> JobFeedback:
+        """Save user feedback on a job."""
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO feedback (id, job_id, feedback_type, notes, created_at)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (id) DO UPDATE SET
+                    feedback_type = EXCLUDED.feedback_type,
+                    notes = EXCLUDED.notes
+                """,
+                feedback.id, feedback.job_id, feedback.feedback_type.value,
+                feedback.notes, feedback.created_at
+            )
+        return feedback
+    
+    async def get_feedback(self, job_id: str) -> list[JobFeedback]:
+        """Get all feedback for a job."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM feedback WHERE job_id = $1 ORDER BY created_at DESC",
+                job_id
+            )
+        return [self._row_to_feedback(row) for row in rows]
+    
+    async def list_feedback(self, feedback_type: Optional[FeedbackType] = None, limit: int = 100) -> list[JobFeedback]:
+        """List feedback, optionally filtered by type."""
+        async with self._pool.acquire() as conn:
+            if feedback_type:
+                rows = await conn.fetch(
+                    "SELECT * FROM feedback WHERE feedback_type = $1 ORDER BY created_at DESC LIMIT $2",
+                    feedback_type.value, limit
+                )
+            else:
+                rows = await conn.fetch(
+                    "SELECT * FROM feedback ORDER BY created_at DESC LIMIT $1",
+                    limit
+                )
+        return [self._row_to_feedback(row) for row in rows]
+    
+    # Application package methods
+    async def save_application_package(self, package: ApplicationPackage) -> ApplicationPackage:
+        """Save an application package."""
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO application_packages (
+                    id, job_id, profile_id, resume_suggestions,
+                    cover_letter, intro_email, recruiters, status, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                ON CONFLICT (id) DO UPDATE SET
+                    resume_suggestions = EXCLUDED.resume_suggestions,
+                    cover_letter = EXCLUDED.cover_letter,
+                    intro_email = EXCLUDED.intro_email,
+                    recruiters = EXCLUDED.recruiters,
+                    status = EXCLUDED.status,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                package.id, package.job.id, package.profile.id,
+                json.dumps(package.resume_suggestions), package.cover_letter,
+                package.intro_email, json.dumps(package.recruiters),
+                package.status, package.created_at
+            )
+        return package
+    
+    async def get_application_package(self, package_id: str) -> Optional[ApplicationPackage]:
+        """Get an application package by ID."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT ap.*, j.title as job_title, j.company as job_company
+                FROM application_packages ap
+                LEFT JOIN jobs j ON ap.job_id = j.id
+                WHERE ap.id = $1
+                """,
+                package_id
+            )
+        if row:
+            return await self._row_to_package(row)
+        return None
+    
+    async def list_application_packages(self, status: Optional[str] = None, limit: int = 100) -> list[ApplicationPackage]:
+        """List application packages, optionally filtered by status."""
+        async with self._pool.acquire() as conn:
+            if status:
+                rows = await conn.fetch(
+                    """
+                    SELECT ap.*, j.title as job_title, j.company as job_company
+                    FROM application_packages ap
+                    LEFT JOIN jobs j ON ap.job_id = j.id
+                    WHERE ap.status = $1
+                    ORDER BY ap.created_at DESC LIMIT $2
+                    """,
+                    status, limit
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT ap.*, j.title as job_title, j.company as job_company
+                    FROM application_packages ap
+                    LEFT JOIN jobs j ON ap.job_id = j.id
+                    ORDER BY ap.created_at DESC LIMIT $1
+                    """,
+                    limit
+                )
+        packages = []
+        for row in rows:
+            pkg = await self._row_to_package(row)
+            if pkg:
+                packages.append(pkg)
+        return packages
+    
     def _row_to_job(self, row) -> Job:
         """Convert a database row to a Job object."""
         skills = row['skills'] if isinstance(row['skills'], list) else json.loads(row['skills'] or '[]')
@@ -667,6 +780,50 @@ class PostgresJobStore(JobStore):
             embedding=list(row['embedding']) if row['embedding'] is not None else None,
             created_at=row['created_at'],
             updated_at=row['updated_at'],
+        )
+    
+    def _row_to_feedback(self, row) -> JobFeedback:
+        """Convert a database row to a JobFeedback object."""
+        return JobFeedback(
+            id=row['id'],
+            job_id=row['job_id'],
+            feedback_type=FeedbackType(row['feedback_type']),
+            notes=row['notes'],
+            created_at=row['created_at'],
+        )
+    
+    async def _row_to_package(self, row) -> Optional[ApplicationPackage]:
+        """Convert a database row to an ApplicationPackage object."""
+        # Load related job and profile
+        job = await self.get(row['job_id'])
+        profile = await self.get_profile(row['profile_id']) if row['profile_id'] else None
+        
+        if not job:
+            logger.warning(f"Job {row['job_id']} not found for package {row['id']}")
+            return None
+        
+        resume_suggestions = row['resume_suggestions']
+        if isinstance(resume_suggestions, str):
+            resume_suggestions = json.loads(resume_suggestions)
+        elif resume_suggestions is None:
+            resume_suggestions = []
+        
+        recruiters = row['recruiters']
+        if isinstance(recruiters, str):
+            recruiters = json.loads(recruiters)
+        elif recruiters is None:
+            recruiters = []
+        
+        return ApplicationPackage(
+            id=row['id'],
+            job=job,
+            profile=profile or UserProfile(),
+            resume_suggestions=resume_suggestions,
+            cover_letter=row['cover_letter'] or "",
+            intro_email=row['intro_email'] or "",
+            recruiters=recruiters,
+            status=row['status'] or "draft",
+            created_at=row['created_at'],
         )
     
     async def update_job_embeddings(self, job_embeddings: list[tuple[str, list[float]]]) -> int:
