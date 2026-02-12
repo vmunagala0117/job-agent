@@ -968,26 +968,28 @@ class CoordinatorExecutor(Executor):
             usage_totals["total_tokens"] += tot_tok
 
         # 3. Audit log — structured OTel spans for each tool call
+        #    Agent Framework uses FunctionCallContent (attrs: name, call_id, arguments)
+        #    and FunctionResultContent (attrs: call_id, result).
         tool_calls = []
         for message in response.messages:
             if not message.contents:
                 continue
             for c in message.contents:
-                if hasattr(c, "function_name"):
-                    tool_name = c.function_name
+                # FunctionCallContent: type="function_call", attrs: name, call_id, arguments
+                if getattr(c, "type", None) == "function_call":
+                    tool_name = c.name
                     args_str = ""
-                    if hasattr(c, "arguments") and c.arguments:
+                    if c.arguments:
                         args_str = str(c.arguments)[:500]
 
-                    # Find the matching tool result
+                    # Find the matching tool result (FunctionResultContent has .call_id and .result)
                     tool_result = ""
-                    tool_call_id = getattr(c, "id", None)
-                    if tool_call_id:
+                    if c.call_id:
                         for rm in response.messages:
                             if rm.contents:
                                 for rc in rm.contents:
-                                    if getattr(rc, "tool_call_id", None) == tool_call_id:
-                                        tool_result = (getattr(rc, "text", "") or "")[:500]
+                                    if getattr(rc, "call_id", None) == c.call_id and hasattr(rc, "result"):
+                                        tool_result = str(rc.result or "")[:500]
                                         break
 
                     # Emit structured audit span
@@ -1001,8 +1003,8 @@ class CoordinatorExecutor(Executor):
                     tool_calls.append(tool_name)
                     logger.info("[TRACE] 🔧 Tool call: %s(%s)", tool_name, args_str[:200])
 
-                elif hasattr(c, "tool_call_id") and hasattr(c, "text"):
-                    result_preview = (c.text or "")[:150]
+                elif getattr(c, "type", None) == "function_result":
+                    result_preview = str(c.result or "")[:150]
                     logger.info("[TRACE] ← Tool result: %s", result_preview)
 
         # Summarize tool flow

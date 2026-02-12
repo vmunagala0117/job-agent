@@ -1,319 +1,286 @@
-# Job Agent — Dual-Agent Job Search System
+# Job Agent
 
-A production-intent job search system using **Microsoft Agent Framework** with a multi-agent orchestration pattern. A **Coordinator** routes requests to two specialist agents: a **Job Search Agent** for finding and ranking jobs, and an **Application Prep Agent** for generating tailored application materials.
+A production-grade AI job search assistant built with **Microsoft Agent Framework** and **Azure OpenAI**. A multi-agent system that searches for jobs, ranks them against your profile, and generates tailored application materials — all through natural language conversation.
+
+## Quick Start
+
+```powershell
+# 1. Clone and setup
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+pip install -e .
+
+# 2. Configure (copy .env.example → .env, fill in Azure OpenAI credentials)
+
+# 3. Run the web app
+python -m job_agent.webapp
+# Open http://localhost:8000
+```
 
 ## Architecture
 
 ```
-User Request
-     │
-     ▼
-┌──────────────────────────────────────────────┐
-│           CoordinatorExecutor                 │
-│                                              │
-│  ┌────────────────────────────────────────┐  │
-│  │  Classifier (lightweight LLM call)     │  │
-│  │  → outputs JOB_SEARCH or APP_PREP      │  │
-│  └──────────┬───────────────┬─────────────┘  │
-│             │               │                │
-│      JOB_SEARCH        APP_PREP              │
-│             │               │                │
-│             ▼               ▼                │
-│  ┌─────────────────┐ ┌───────────────────┐   │
-│  │ Job Search Agent │ │ App Prep Agent    │   │
-│  │ (11 tools)       │ │ (3 tools)         │   │
-│  │ • search_jobs    │ │ • analyze_job_fit │   │
-│  │ • list_saved     │ │ • prepare_app     │   │
-│  │ • get_details    │ │ • get_package     │   │
-│  │ • rank_saved     │ └───────────────────┘   │
-│  │ • set_profile    │                         │
-│  │ • upload_resume  │                         │
-│  │ • send_notifs    │                         │
-│  │ • feedback       │                         │
-│  │ • mark_applied   │                         │
-│  │ • mark_rejected  │                         │
-│  │ • get_profile    │                         │
-│  └─────────────────┘                          │
-└──────────────────────────────────────────────┘
-         │                      │
-         ▼                      ▼
-┌──────────────────────────────────────────────┐
-│              Shared Services                  │
-│  • JobStore (PostgreSQL + pgvector)           │
-│  • RankingService (embeddings + heuristics)   │
-│  • EmbeddingService (text-embedding-3-small)  │
-│  • NotificationService (email/Teams/Slack)    │
-│  • ResumeParser (PDF/DOCX extraction)         │
-│  • Azure OpenAI (gpt-5.2 for reasoning)       │
-└──────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│                    FastAPI Web App                         │
+│  Chat UI • Profile Management • Resume Upload • Feedback  │
+└──────────────────────┬───────────────────────────────────┘
+                       │
+                       ▼
+┌──────────────────────────────────────────────────────────┐
+│              CoordinatorExecutor                          │
+│                                                          │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │  Classifier (logprobs-based, confidence scoring)   │  │
+│  │  → JOB_SEARCH (98.6%)  or  APP_PREP (91.4%)       │  │
+│  └──────────┬──────────────────────┬─────────────────┘  │
+│             │                      │                     │
+│             ▼                      ▼                     │
+│  ┌──────────────────┐   ┌────────────────────┐          │
+│  │ Job Search Agent  │   │ App Prep Agent     │          │
+│  │ (11 tools)        │   │ (3 tools)          │          │
+│  │ • search_jobs     │   │ • analyze_job_fit  │          │
+│  │ • get_profile     │   │ • prepare_app      │          │
+│  │ • rank_saved      │   │ • get_package      │          │
+│  │ • list_saved      │   └────────────────────┘          │
+│  │ • get_details     │                                   │
+│  │ • set_profile     │                                   │
+│  │ • upload_resume   │                                   │
+│  │ • send_notifs     │                                   │
+│  │ • feedback        │                                   │
+│  │ • mark_applied    │                                   │
+│  │ • mark_rejected   │                                   │
+│  └──────────────────┘                                    │
+└──────────────────────────────────────────────────────────┘
+                       │
+                       ▼
+┌──────────────────────────────────────────────────────────┐
+│                   Shared Services                         │
+│  • PostgreSQL + pgvector    • Azure OpenAI (gpt-5.2)      │
+│  • RankingService           • EmbeddingService             │
+│  • NotificationService      • ResumeParser                 │
+│  • ApplicationPrepService   • OpenTelemetry + App Insights │
+└──────────────────────────────────────────────────────────┘
 ```
 
-### Routing Pattern
-
-The system uses a **classifier-based routing** pattern inside a `CoordinatorExecutor`:
-- **Intent classification**: A lightweight LLM call classifies each request as `JOB_SEARCH` or `APP_PREP`
-- **Programmatic delegation**: The coordinator runs the appropriate specialist agent's `.run()` method
-- **Full conversation history**: Each specialist sees the complete chat context
-- **WorkflowBuilder**: Single-node executor wrapping the multi-agent logic, served via `from_agent_framework()`
-
-### Data Flow
-
-```
-1. SEARCH FLOW:
-   User → Coordinator → Job Search Agent
-   Job Search Agent:
-     fetch_jobs(SerpAPI) → embed_jobs(Azure OpenAI) → store(PostgreSQL)
-     rank_jobs(cosine similarity + heuristics) → notify(console/email/Teams/Slack)
-   
-2. APPLICATION PREP FLOW:
-   User → Coordinator → Application Prep Agent
-   Application Prep Agent:
-     load_job + load_profile → analyze_fit(LLM)
-     → generate_resume_diff(LLM) → generate_cover_letter(LLM)
-     → find_recruiters(Proxycurl API) → generate_intro_email(LLM)
-     → package & store(PostgreSQL)
-```
+The system uses **classifier-based routing** — a lightweight LLM call with logprobs classifies each request as `JOB_SEARCH` or `APP_PREP`, then the appropriate specialist agent runs with the full conversation history and its own tool set.
 
 ## Features
 
-- **Multi-Agent Orchestration**: Coordinator (classifier) + Job Search Agent (11 tools) + App Prep Agent (3 tools)
-- **Job Search**: SerpAPI Google Jobs API (aggregates LinkedIn, Indeed, Glassdoor, etc.)
-- **Resume Parsing**: Upload PDF/DOCX resumes — auto-extracts skills, experience, creates embeddings
-- **Embedding-Based Ranking**: Jobs ranked by fit using Azure OpenAI embeddings + heuristic boosts
-- **Notifications**: Deliver top matches via console, email, Teams, or Slack
-- **Feedback Loop**: Capture user feedback (good fit, not relevant, tailor resume, etc.)
-- **Application Prep**: LLM-generated resume diff suggestions, cover letters, intro emails
-- **Recruiter Search**: Find relevant recruiters at target companies (Proxycurl API)
-- **Persistent Storage**: PostgreSQL + pgvector for jobs, profiles, feedback, application packages
-- **Conversational Interface**: Natural language interaction via HTTP-hosted agent
+| Category | Capabilities |
+|----------|-------------|
+| **Multi-Agent System** | Coordinator with classifier-based routing, logprobs confidence scoring, two specialist agents (14 tools total) |
+| **Job Search** | SerpAPI Google Jobs (aggregates LinkedIn, Indeed, Glassdoor), embedding-based ranking with heuristic boosts |
+| **Profile Management** | Web-based profile form, PDF/DOCX resume upload with auto-extraction of skills/experience/title |
+| **Application Prep** | LLM-generated resume diff suggestions, cover letters, intro emails, job fit analysis |
+| **Notifications** | Console, email (SMTP), Microsoft Teams (webhooks), Slack (webhooks) |
+| **Feedback** | Thumbs up/down on responses, per-job feedback (good fit, not relevant, tailor resume, etc.) |
+| **Persistence** | PostgreSQL + pgvector for jobs, profiles, feedback, application packages |
+| **Observability** | OpenTelemetry → Azure Application Insights, structured audit spans, classifier confidence tracking |
+| **Web UI** | Chat interface, profile modal, resume upload, collapsible trace panel, feedback buttons |
 
 ## Project Structure
 
 ```
 src/job_agent/
+├── webapp.py            # FastAPI web application (primary entry point)
+├── workflows.py         # Multi-agent orchestration (Coordinator + Specialists)
 ├── config.py            # Configuration (Azure OpenAI, SerpAPI, PostgreSQL)
 ├── clients.py           # Azure OpenAI client factory
-├── models.py            # Data models (Job, UserProfile, RankedJob, ApplicationPackage)
-├── store.py             # Storage (InMemoryJobStore, PostgresJobStore with pgvector)
-├── providers.py         # Job ingestion (SerpAPI, Mock)
-├── ranking.py           # Embedding + heuristic ranking service
-├── resume_parser.py     # PDF/DOCX resume parsing and skill extraction
-├── notifications.py     # Notification delivery (email, Teams, Slack, console)
-├── application_prep.py  # Application material generation service
+├── models.py            # Data models (Job, UserProfile, RankedJob, etc.)
+├── store.py             # Storage (InMemory / PostgreSQL with pgvector)
+├── providers.py         # Job ingestion (SerpAPI / Mock)
+├── ranking.py           # Embedding + heuristic ranking
+├── resume_parser.py     # PDF/DOCX parsing and skill extraction
+├── notifications.py     # Notification delivery (email/Teams/Slack/console)
+├── application_prep.py  # Application material generation (resume, cover letter, email)
 ├── tools.py             # Shared profile state
-├── workflows.py         # Multi-agent workflow (Coordinator + Specialists)
-└── server.py            # HTTP server entry point
+├── server.py            # Headless Agent Server SDK entry point
+└── static/              # Web UI (HTML/CSS/JS)
+    ├── index.html
+    ├── css/style.css
+    └── js/app.js
+
+docs/
+├── TECHNICAL.md         # Internal code flow and architecture details
+└── kql-queries.kql      # 14 ready-to-run Application Insights queries
 
 scripts/
 ├── init_db.py           # Database schema initialization
-├── test_e2e.py          # End-to-end integration test (6 stages)
+├── test_e2e.py          # End-to-end integration test
 ├── test_cli.py          # Interactive CLI test
-├── test_routing.py      # Multi-agent routing test (3 scenarios)
+├── test_routing.py      # Multi-agent routing test
 ├── test_workflow.py     # Workflow smoke test
-└── test_notifications.py # Notification/feedback/prep test
+├── test_notifications.py # Notification/feedback/prep test
+└── test_otel.py         # OpenTelemetry trace test
 ```
 
 ## Prerequisites
-- Python 3.10+ (tested with 3.13)
-- Azure subscription with Azure OpenAI deployment (chat model + embeddings model)
-- PostgreSQL with pgvector (for persistent storage — falls back to in-memory)
-- SerpAPI account (optional, for real job data — falls back to mock)
-- Auth: `az login` for `DefaultAzureCredential` or configure API key
+
+- **Python 3.10+** (tested with 3.13)
+- **Azure OpenAI** with a chat deployment (gpt-4o / gpt-5.2) + embeddings (text-embedding-3-small)
+- **PostgreSQL + pgvector** for persistent storage (optional — falls back to in-memory)
+- **SerpAPI** account for real job data (optional — falls back to mock data)
+- **Auth**: `az login` for `DefaultAzureCredential`, or set `AZURE_OPENAI_API_KEY`
 
 ## Setup
 
-1. Create and activate a virtual environment:
-   ```powershell
-   python -m venv .venv
-   .\.venv\Scripts\Activate.ps1
-   ```
+### 1. Environment
 
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   pip install -e .
-   ```
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+pip install -e .
+```
 
-3. Copy `.env.example` to `.env` and configure:
-   ```env
-   AZURE_OPENAI_ENDPOINT=https://<your-resource>.openai.azure.com
-   AZURE_OPENAI_DEPLOYMENT_NAME=<chat-deployment>
-   AZURE_OPENAI_API_KEY=<optional-if-using-managed-identity>
-   SERPAPI_API_KEY=<your-serpapi-key>
-   
-   # PostgreSQL (optional - defaults to in-memory storage)
-   DATABASE_URL=postgresql://user:password@localhost:5432/job_agent
-   # Or individual components:
-   # DB_HOST=localhost
-   # DB_PORT=5432
-   # DB_NAME=job_agent
-   # DB_USER=postgres
-   # DB_PASSWORD=your_password
-   ```
+### 2. Configuration
 
-4. (Optional) Initialize PostgreSQL database:
-   ```bash
-   python scripts/init_db.py
-   ```
+Copy `.env.example` to `.env` and configure:
 
-5. Run the server:
-   ```bash
-   python -m job_agent.server --server
-   ```
+```env
+# Required — Azure OpenAI
+AZURE_OPENAI_ENDPOINT=https://<your-resource>.openai.azure.com
+AZURE_OPENAI_DEPLOYMENT_NAME=<chat-deployment>
+AZURE_OPENAI_API_KEY=<optional-if-using-managed-identity>
 
-## Testing
+# Optional — Real job data
+SERPAPI_API_KEY=<your-serpapi-key>
 
-### Quick Test with CLI
+# Optional — Persistent storage
+DATABASE_URL=postgresql://user:password@host:5432/job_agent
 
-Run the interactive test CLI (no server required):
+# Optional — Observability
+APPLICATIONINSIGHTS_CONNECTION_STRING=InstrumentationKey=...
+
+# Optional — Recruiter search
+PROXYCURL_API_KEY=<your-proxycurl-key>
+```
+
+### 3. Database (Optional)
 
 ```bash
-python test_cli.py
-```
-
-This starts an interactive session where you can:
-1. Search for jobs (uses mock data if SerpAPI not configured)
-2. Set your profile with skills and preferences
-3. Rank jobs against your profile
-4. Manage job status
-
-### Example Test Session
-
-```
-You: Search for Python developer jobs in Seattle
-Agent: Found 3 jobs matching 'Python developer':
-1. Senior Python Developer at TechCorp (Seattle, WA) | $140,000-$180,000 [ID: abc12345]
-2. Python Backend Engineer at StartupXYZ (Remote) | $120,000-$160,000 [ID: def67890]
-...
-
-You: Set my profile: My name is John, I have 5 years of experience with Python, AWS, and Kubernetes. I prefer remote work and minimum salary of $150,000.
-Agent: Profile set for John with 3 skills. Ready to rank jobs.
-
-You: Rank my saved jobs
-Agent: Top 3 job matches for John:
-1. Python Backend Engineer at StartupXYZ - Score: 85.2%
-   Matches your skills: python, aws; Remote position matches your preference.
-   [ID: def67890]
-...
-```
-
-### Testing Without Azure OpenAI
-
-If you don't have Azure OpenAI access yet, you can still test the data models and providers:
-
-```python
-# test_offline.py
-import asyncio
-from job_agent.providers import MockJobProvider
-from job_agent.models import JobSearchCriteria
-from job_agent.ranking import MockEmbeddingService, RankingService
-
-async def test():
-    provider = MockJobProvider()
-    jobs = await provider.fetch_jobs(JobSearchCriteria(query="python"))
-    print(f"Found {len(jobs)} mock jobs")
-    for job in jobs:
-        print(f"  - {job.title} at {job.company}")
-
-asyncio.run(test())
-```
-
-## Available Agent Commands
-
-The agent understands natural language. Example interactions:
-
-### Job Search
-- "Search for Python developer jobs in Seattle"
-- "Find remote machine learning engineer positions"
-- "Look for data scientist jobs with salary above $150,000"
-
-### Profile Setup
-- "Set my profile with skills Python, AWS, Kubernetes"
-- "I prefer remote work and minimum salary of $180,000"
-
-### Job Ranking
-- "Rank my saved jobs"
-- "Show me the best job matches"
-
-### Job Management
-- "List my saved jobs"
-- "Show details for job abc123"
-- "Mark job abc123 as applied"
-
-## Configuration Options
-
-| Variable | Description | Required |
-|----------|-------------|----------|
-| `AZURE_OPENAI_ENDPOINT` | Azure OpenAI resource endpoint | Yes |
-| `AZURE_OPENAI_DEPLOYMENT_NAME` | Chat model deployment name (e.g., gpt-4o) | Yes |
-| `AZURE_OPENAI_API_KEY` | API key (leave empty for managed identity) | No |
-| `AZURE_OPENAI_API_VERSION` | API version (default: 2024-02-15-preview) | No |
-| `AZURE_OPENAI_EMBEDDING_MODEL` | Embedding model name (default: text-embedding-3-small) | No |
-| `SERPAPI_API_KEY` | SerpAPI key for Google Jobs | No* |
-| `DATABASE_URL` | PostgreSQL connection URL | No** |
-| `DB_HOST` | PostgreSQL host (default: localhost) | No** |
-| `DB_PORT` | PostgreSQL port (default: 5432) | No** |
-| `DB_NAME` | Database name (default: job_agent) | No** |
-| `DB_USER` | Database user (default: postgres) | No** |
-| `DB_PASSWORD` | Database password | No** |
-
-*Without SerpAPI, the agent uses mock job data for testing.
-
-**Without PostgreSQL, the agent uses in-memory storage (data lost on restart).
-
-## PostgreSQL Storage
-
-For persistent storage with vector similarity search, configure PostgreSQL with pgvector:
-
-### Quick Setup (Docker)
-
-```bash
-# Start PostgreSQL with pgvector
+# Docker
 docker run -d --name job-agent-db \
-  -e POSTGRES_PASSWORD=mysecretpassword \
-  -e POSTGRES_DB=job_agent \
-  -p 5432:5432 \
-  pgvector/pgvector:pg16
-
-# Set environment variable
-export DATABASE_URL=postgresql://postgres:mysecretpassword@localhost:5432/job_agent
+  -e POSTGRES_PASSWORD=mysecretpassword -e POSTGRES_DB=job_agent \
+  -p 5432:5432 pgvector/pgvector:pg16
 
 # Initialize schema
 python scripts/init_db.py
 ```
 
-### Azure Database for PostgreSQL
+For production, use **Azure Database for PostgreSQL Flexible Server** with the pgvector extension enabled.
 
-For production, use Azure Database for PostgreSQL Flexible Server:
+### 4. Run
 
-1. Create a PostgreSQL Flexible Server with pgvector extension enabled
-2. Set the `DATABASE_URL` environment variable
-3. Run `python scripts/init_db.py` to create tables
+```bash
+# Web application (recommended)
+python -m job_agent.webapp
 
-### Features
+# Or headless server (Agent Server SDK)
+python -m job_agent.server --server
+```
 
-- **Full-text search**: Fast search across job titles, companies, and descriptions
-- **Vector similarity**: Find jobs semantically similar to your profile using pgvector
-- **Persistent profiles**: User profiles and preferences stored across sessions
-- **Batch embedding updates**: Efficiently update job embeddings in batches
+Open [http://localhost:8000](http://localhost:8000) for the web UI.
+
+## Web API Reference
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/` | Chat UI |
+| `GET` | `/health` | Health check |
+| `POST` | `/api/chat` | Send message, get response |
+| `POST` | `/api/upload-resume` | Upload PDF/DOCX resume |
+| `GET` | `/api/profiles` | List all profiles |
+| `GET` | `/api/profiles/{id}` | Get profile details |
+| `POST` | `/api/profiles/save` | Create/update profile |
+| `POST` | `/api/profiles/select` | Switch active profile |
+| `POST` | `/api/feedback` | Thumbs up/down on response |
+| `GET` | `/api/feedback` | List feedback entries |
+| `GET` | `/api/traces` | Get trace log for session |
+| `POST` | `/api/chat/reset` | Reset conversation |
+
+## Usage Examples
+
+The agent understands natural language:
+
+```
+# Job Search
+"Search for Python developer jobs in Seattle"
+"Find remote machine learning engineer positions"
+"Look for data scientist jobs with salary above $150,000"
+"Search for jobs based on my preferences"
+
+# Profile & Ranking
+"Show me my profile"
+"Rank my saved jobs"
+"Show me the best job matches"
+
+# Application Prep
+"Generate a cover letter for this role"
+"Draft an intro email to the hiring manager"
+"Analyze my fit for this position"
+
+# Job Management
+"List my saved jobs"
+"Show details for job abc123"
+"Mark job abc123 as applied"
+```
 
 ## How Ranking Works
 
-1. **Profile Embedding**: Your resume and skills are embedded using Azure OpenAI
-2. **Job Embedding**: Each job's title, description, and skills are embedded
-3. **Similarity Scoring**: Cosine similarity between profile and job embeddings
-4. **Heuristic Boosts**: Additional scores for skill overlap (25%), location (15%), salary (10%)
-5. **Composite Score**: Weighted combination of all factors (0-100%)
+1. **Profile Embedding** — Resume + skills embedded via Azure OpenAI (text-embedding-3-small, 1536d)
+2. **Job Embedding** — Title + description + skills embedded
+3. **Cosine Similarity** (50%) — Semantic match between profile and job
+4. **Skill Overlap** (25%) — Set intersection of skills
+5. **Location Match** (15%) — Preferred locations overlap
+6. **Salary Match** (10%) — Min salary comparison
+7. **Composite Score** — Weighted 0–100%
 
-## Next Steps
+## Observability
 
+The system emits structured OpenTelemetry spans to Azure Application Insights:
+
+- **Classifier spans** — Intent, confidence %, alternatives, user message
+- **Tool call spans** — Tool name, arguments, result preview, agent attribution
+- **Feedback spans** — Rating (up/down), response preview
+- **Token usage** — Input/output/total per request
+
+See [docs/kql-queries.kql](docs/kql-queries.kql) for 14 ready-to-run KQL queries.
+
+## Configuration Reference
+
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `AZURE_OPENAI_ENDPOINT` | Azure OpenAI resource endpoint | Yes |
+| `AZURE_OPENAI_DEPLOYMENT_NAME` | Chat model deployment name | Yes |
+| `AZURE_OPENAI_API_KEY` | API key (leave empty for managed identity) | No |
+| `AZURE_OPENAI_API_VERSION` | API version (default: `2024-05-01-preview`) | No |
+| `AZURE_OPENAI_EMBEDDING_MODEL` | Embedding model (default: `text-embedding-3-small`) | No |
+| `SERPAPI_API_KEY` | SerpAPI key for Google Jobs | No |
+| `DATABASE_URL` | PostgreSQL connection URL | No |
+| `APPLICATIONINSIGHTS_CONNECTION_STRING` | Azure Monitor connection string | No |
+| `PROXYCURL_API_KEY` | Proxycurl API for recruiter search | No |
+
+## Documentation
+
+- **[docs/TECHNICAL.md](docs/TECHNICAL.md)** — Internal code flow, request lifecycle, module reference, design decisions
+- **[docs/kql-queries.kql](docs/kql-queries.kql)** — Application Insights KQL queries for monitoring
+
+## Roadmap
+
+- [x] Multi-agent orchestration (Coordinator → Job Search + App Prep)
+- [x] FastAPI web application with chat UI
+- [x] Profile management with resume upload
 - [x] Persistent storage (PostgreSQL + pgvector)
-- [x] Resume parsing (PDF/DOCX with skill extraction)
 - [x] Embedding-based job ranking with heuristic boosts
+- [x] Resume parsing (PDF/DOCX with skill extraction)
 - [x] Notification delivery (email/Teams/Slack/console)
-- [x] User feedback loop (good fit, not relevant, tailor resume)
-- [x] Application-prep service (resume diff, cover letters, intro emails)
-- [x] Multi-agent orchestration (Coordinator → Job Search + App Prep via classifier routing)
+- [x] User feedback (thumbs up/down + per-job feedback)
+- [x] Application prep (resume suggestions, cover letters, intro emails)
+- [x] Enterprise monitoring (OpenTelemetry → Azure Application Insights)
+- [x] Classifier confidence scoring (logprobs)
+- [x] Structured audit logging (tool-level OTel spans)
+- [ ] Recruiter search integration
 - [ ] Scheduled job ingestion (cron-based auto-search)
 - [ ] Evaluation and tracing (pytest-agent-evals)
-- [ ] Recruiter search integration (Proxycurl API)
