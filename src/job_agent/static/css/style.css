@@ -143,6 +143,12 @@ html, body {
     color: var(--color-text);
 }
 
+.btn-sm {
+    padding: 4px 10px;
+    font-size: 12px;
+    gap: 4px;
+}
+
 /* --- Content Wrapper (chat + trace panel) --- */
 .content-wrapper {
     flex: 1;
@@ -703,6 +709,289 @@ html, body {
     text-align: center;
     font-family: var(--font-sans);
     font-size: 13px;
+}
+
+/* --- Response metadata bar --- */
+.message-meta {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: 8px;
+    padding-top: 6px;
+    border-top: 1px solid rgba(0, 0, 0, 0.06);
+    font-size: 11.5px;
+    color: #94a3b8;
+    flex-wrap: wrap;
+}
+
+.message-meta .meta-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+}
+
+.message-meta .meta-item svg {
+    width: 12px;
+    height: 12px;
+    opacity: 0.7;
+}
+
+/* --- Feedback buttons --- */
+.feedback-btns {
+    display: inline-flex;
+    gap: 2px;
+    margin-left: auto;
+}
+
+.feedback-btns button {
+    background: none;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    padding: 3px 6px;
+    cursor: pointer;
+    font-size: 14px;
+    color: #94a3b8;
+    transition: all 150ms ease;
+    line-height: 1;
+}
+
+.feedback-btns button:hover {
+    background: rgba(0, 0, 0, 0.04);
+    color: #475569;
+}
+
+.feedback-btns button.selected-up {
+    color: #22c55e;
+    border-color: #22c55e;
+    background: rgba(34, 197, 94, 0.08);
+}
+
+.feedback-btns button.selected-down {
+    color: #ef4444;
+    border-color: #ef4444;
+    background: rgba(239, 68, 68, 0.08);
+}
+
+.feedback-btns button.disabled {
+    pointer-events: none;
+    opacity: 0.5;
+}
+
+/* --- Profile edit button --- */
+#profile-edit-btn {
+    margin-left: 4px;
+    color: var(--color-text-secondary);
+}
+#profile-edit-btn:hover {
+    color: var(--color-primary);
+}
+
+/* --- Modal overlay & dialog --- */
+.modal-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 200;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.45);
+    backdrop-filter: blur(3px);
+    animation: fadeIn 150ms ease;
+}
+
+.modal-overlay[hidden] {
+    display: none !important;
+}
+
+.modal {
+    background: var(--color-surface);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-lg), 0 0 0 1px var(--color-border);
+    width: 560px;
+    max-width: 95vw;
+    max-height: 90vh;
+    display: flex;
+    flex-direction: column;
+    animation: modalPop 200ms ease;
+}
+
+@keyframes modalPop {
+    from { opacity: 0; transform: scale(0.96) translateY(8px); }
+    to   { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+.modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 20px 12px;
+    border-bottom: 1px solid var(--color-border);
+}
+
+.modal-header h2 {
+    font-size: 17px;
+    font-weight: 600;
+}
+
+.modal-close {
+    color: var(--color-text-secondary);
+}
+.modal-close:hover {
+    color: var(--color-text);
+}
+
+.modal-body {
+    padding: 16px 20px;
+    overflow-y: auto;
+    flex: 1;
+}
+
+.modal-footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    padding-top: 16px;
+    border-top: 1px solid var(--color-border);
+    margin-top: 12px;
+}
+
+/* --- Form elements --- */
+.form-row {
+    display: flex;
+    gap: 12px;
+}
+.form-row > .form-group {
+    flex: 1;
+}
+
+.form-group {
+    margin-bottom: 12px;
+}
+
+.form-group label {
+    display: block;
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--color-text-secondary);
+    margin-bottom: 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+
+.form-group label .hint {
+    font-weight: 400;
+    text-transform: none;
+    color: var(--color-text-muted);
+    font-size: 11px;
+}
+
+.form-group input[type="text"],
+.form-group input[type="email"],
+.form-group input[type="number"],
+.form-group textarea,
+.form-group select {
+    width: 100%;
+    padding: 8px 10px;
+    font-size: 13.5px;
+    font-family: var(--font-sans);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    background: var(--color-bg);
+    color: var(--color-text);
+    transition: border-color var(--transition);
+}
+
+.form-group input:focus,
+.form-group textarea:focus,
+.form-group select:focus {
+    outline: none;
+    border-color: var(--color-primary);
+    box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+}
+
+.form-group textarea {
+    resize: vertical;
+    min-height: 48px;
+}
+
+.resume-upload-area {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.resume-file-name {
+    font-size: 12.5px;
+    color: var(--color-text-secondary);
+}
+
+.resume-file-name.has-file {
+    color: var(--color-success);
+    font-weight: 500;
+}
+
+#pf-save-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* --- Resume summary (read-only extracted details) --- */
+.resume-summary {
+    background: var(--color-assistant-bubble);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    padding: 10px 14px;
+    margin-bottom: 12px;
+    font-size: 13px;
+    line-height: 1.5;
+}
+
+.resume-summary[hidden] {
+    display: none !important;
+}
+
+.resume-summary-header {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--color-text-muted);
+    margin-bottom: 6px;
+}
+
+.resume-summary-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px 16px;
+    margin-bottom: 4px;
+}
+
+.resume-summary-row {
+    margin-top: 4px;
+}
+
+.resume-summary .label {
+    font-weight: 600;
+    color: var(--color-text-secondary);
+    margin-right: 6px;
+}
+
+.resume-summary .label::after {
+    content: ":";
+}
+
+/* --- Form divider & section label --- */
+.form-divider {
+    border: none;
+    border-top: 1px solid var(--color-border);
+    margin: 16px 0 8px;
+}
+
+.form-section-label {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--color-text-secondary);
+    margin-bottom: 12px;
 }
 
 /* --- Responsive --- */

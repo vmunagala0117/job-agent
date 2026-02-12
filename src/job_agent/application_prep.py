@@ -119,7 +119,7 @@ Description:
 Required Skills: {', '.join(job.skills) if job.skills else 'Not specified'}
 
 CURRENT RESUME:
-{profile.resume_text[:3000]}
+{profile.resume_text}
 
 Skills: {', '.join(profile.skills)}
 Current Title: {profile.current_title}
@@ -175,7 +175,7 @@ Name: {profile.name}
 Current Title: {profile.current_title}
 Key Skills: {', '.join(profile.skills[:10])}
 Years Experience: {profile.years_experience or 'Not specified'}
-Summary: {profile.summary or profile.resume_text[:500]}
+Summary: {profile.summary or profile.resume_text[:2000]}
 
 Requirements:
 1. Keep it under 250 words

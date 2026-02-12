@@ -1,0 +1,199 @@
+// ============================================================
+// Job Agent — Application Insights KQL Queries
+// ============================================================
+// Usage: Copy any query below into App Insights → Logs → Run
+// Resource: Instrumentation Key 0c98882b-abd0-46e7-b5c3-...
+// ============================================================
+
+
+// -----------------------------------------------------------
+// 1. All custom spans (last hour overview)
+// -----------------------------------------------------------
+// Shows every classifier, agent, and tool span emitted by the app.
+
+dependencies
+| where timestamp > ago(1h)
+| where name in ("classifier", "specialist_agent", "tool_call", "response_feedback")
+| project timestamp, name, duration, customDimensions
+| order by timestamp desc
+
+
+// -----------------------------------------------------------
+// 2. Classifier decisions with confidence scores
+// -----------------------------------------------------------
+// What intent was picked for each user message and how confident?
+
+dependencies
+| where timestamp > ago(1h)
+| where name == "classifier"
+| extend intent      = tostring(customDimensions["classifier.intent"]),
+         confidence  = todouble(customDimensions["classifier.confidence_pct"]),
+         user_msg    = tostring(customDimensions["classifier.user_message"]),
+         alternatives = tostring(customDimensions["classifier.alternatives"])
+| project timestamp, user_msg, intent, confidence, alternatives
+| order by timestamp desc
+
+
+// -----------------------------------------------------------
+// 3. Low-confidence classifications (< 80%)
+// -----------------------------------------------------------
+// Flag uncertain routing — candidates for prompt tuning.
+
+dependencies
+| where timestamp > ago(24h)
+| where name == "classifier"
+| extend intent     = tostring(customDimensions["classifier.intent"]),
+         confidence = todouble(customDimensions["classifier.confidence_pct"]),
+         user_msg   = tostring(customDimensions["classifier.user_message"])
+| where confidence < 80
+| project timestamp, user_msg, intent, confidence
+| order by confidence asc
+
+
+// -----------------------------------------------------------
+// 4. Tool invocations (audit trail)
+// -----------------------------------------------------------
+// Which tools were called, by which agent, with what args?
+
+dependencies
+| where timestamp > ago(1h)
+| where name == "tool_call"
+| extend tool   = tostring(customDimensions["tool.name"]),
+         agent  = tostring(customDimensions["tool.agent"]),
+         args   = tostring(customDimensions["tool.arguments"]),
+         result = tostring(customDimensions["tool.result_preview"])
+| project timestamp, agent, tool, args, result
+| order by timestamp desc
+
+
+// -----------------------------------------------------------
+// 5. Tool usage frequency (last 24 hours)
+// -----------------------------------------------------------
+// Which tools are used most often?
+
+dependencies
+| where timestamp > ago(24h)
+| where name == "tool_call"
+| extend tool = tostring(customDimensions["tool.name"])
+| summarize call_count = count() by tool
+| order by call_count desc
+| render barchart
+
+
+// -----------------------------------------------------------
+// 6. Agent routing distribution
+// -----------------------------------------------------------
+// How often is each specialist agent invoked?
+
+dependencies
+| where timestamp > ago(24h)
+| where name == "specialist_agent"
+| extend agent = tostring(customDimensions["agent.name"]),
+         intent = tostring(customDimensions["agent.intent"])
+| summarize invocations = count() by agent
+| order by invocations desc
+| render piechart
+
+
+// -----------------------------------------------------------
+// 7. Average response time by agent
+// -----------------------------------------------------------
+
+dependencies
+| where timestamp > ago(24h)
+| where name == "specialist_agent"
+| extend agent = tostring(customDimensions["agent.name"])
+| summarize avg_ms = avg(duration), p95_ms = percentile(duration, 95), calls = count() by agent
+| order by avg_ms desc
+
+
+// -----------------------------------------------------------
+// 8. User feedback summary
+// -----------------------------------------------------------
+
+dependencies
+| where timestamp > ago(7d)
+| where name == "response_feedback"
+| extend rating  = tostring(customDimensions["feedback.rating"]),
+         session = tostring(customDimensions["feedback.session_id"])
+| summarize thumbs_up   = countif(rating == "up"),
+            thumbs_down = countif(rating == "down"),
+            total       = count()
+| extend satisfaction_pct = round(100.0 * thumbs_up / total, 1)
+
+
+// -----------------------------------------------------------
+// 9. Feedback detail — thumbs down (investigate issues)
+// -----------------------------------------------------------
+
+dependencies
+| where timestamp > ago(7d)
+| where name == "response_feedback"
+| extend rating  = tostring(customDimensions["feedback.rating"]),
+         session = tostring(customDimensions["feedback.session_id"]),
+         msg_idx = tostring(customDimensions["feedback.message_index"])
+| where rating == "down"
+| project timestamp, session, msg_idx
+| order by timestamp desc
+
+
+// -----------------------------------------------------------
+// 10. End-to-end request timeline
+// -----------------------------------------------------------
+// Show full span tree for a single operation (replace operation_Id).
+
+dependencies
+| where timestamp > ago(1h)
+| where operation_Id == "<PASTE_OPERATION_ID_HERE>"
+| project timestamp, name, duration, customDimensions
+| order by timestamp asc
+
+
+// -----------------------------------------------------------
+// 11. Error rate by span type
+// -----------------------------------------------------------
+
+dependencies
+| where timestamp > ago(24h)
+| where name in ("classifier", "specialist_agent", "tool_call")
+| summarize total = count(), errors = countif(success == false) by name
+| extend error_pct = round(100.0 * errors / total, 1)
+| order by error_pct desc
+
+
+// -----------------------------------------------------------
+// 12. Slowest tool calls (> 2 seconds)
+// -----------------------------------------------------------
+
+dependencies
+| where timestamp > ago(24h)
+| where name == "tool_call"
+| where duration > 2000
+| extend tool  = tostring(customDimensions["tool.name"]),
+         agent = tostring(customDimensions["tool.agent"]),
+         args  = tostring(customDimensions["tool.arguments"])
+| project timestamp, tool, agent, duration, args
+| order by duration desc
+
+
+// -----------------------------------------------------------
+// 13. Hourly traffic pattern
+// -----------------------------------------------------------
+
+dependencies
+| where timestamp > ago(24h)
+| where name == "classifier"
+| summarize requests = count() by bin(timestamp, 1h)
+| render timechart
+
+
+// -----------------------------------------------------------
+// 14. Unique sessions per day (last 7 days)
+// -----------------------------------------------------------
+
+dependencies
+| where timestamp > ago(7d)
+| where name == "classifier"
+| extend session = tostring(customDimensions["classifier.user_message"])
+| summarize sessions = dcount(operation_Id) by bin(timestamp, 1d)
+| render timechart

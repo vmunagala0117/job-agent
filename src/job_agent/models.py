@@ -161,6 +161,26 @@ class JobFeedback:
     created_at: datetime = field(default_factory=datetime.utcnow)
 
 
+class ResponseRating(Enum):
+    """Thumbs up / down on an agent response."""
+    UP = "up"
+    DOWN = "down"
+
+
+@dataclass
+class ResponseFeedback:
+    """User feedback on an agent response, tied to session + message index."""
+
+    session_id: str
+    message_index: int  # 0-based index of the assistant message in the session
+    rating: ResponseRating
+    comment: Optional[str] = None
+
+    # Metadata
+    id: str = field(default_factory=lambda: str(uuid4()))
+    created_at: datetime = field(default_factory=datetime.utcnow)
+
+
 class NotificationChannel(Enum):
     """Notification delivery channels."""
     EMAIL = "email"

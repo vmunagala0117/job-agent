@@ -35,10 +35,23 @@
 
     // Profile selector
     const profileSelect = document.getElementById("profile-select");
+    const profileEditBtn = document.getElementById("profile-edit-btn");
+    const profileNewBtn  = document.getElementById("profile-new-btn");
+
+    // Profile modal elements
+    const profileModal      = document.getElementById("profile-modal");
+    const profileForm       = document.getElementById("profile-form");
+    const modalCloseBtn     = document.getElementById("profile-modal-close");
+    const modalCancelBtn    = document.getElementById("profile-modal-cancel");
+    const pfSaveBtn         = document.getElementById("pf-save-btn");
+    const pfResumeBtn       = document.getElementById("pf-resume-btn");
+    const pfResumeInput     = document.getElementById("pf-resume");
+    const pfResumeName      = document.getElementById("pf-resume-name");
 
     // --- State ---
     let sessionId = null;
     let isProcessing = false;
+    let assistantMsgIndex = 0;  // Tracks assistant message index for feedback
 
     // --- Markdown setup ---
     marked.setOptions({
@@ -75,7 +88,7 @@
     }
 
     // --- Message Rendering ---
-    function addMessage(role, text) {
+    function addMessage(role, text, metadata) {
         // Hide welcome screen on first message
         if (welcomeDiv) {
             welcomeDiv.style.display = "none";
@@ -111,6 +124,49 @@
         } else {
             // Render markdown for assistant messages
             contentEl.innerHTML = marked.parse(text);
+
+            // Add metadata bar + feedback buttons for assistant messages
+            const currentMsgIdx = assistantMsgIndex++;
+            const metaBar = document.createElement("div");
+            metaBar.className = "message-meta";
+
+            // Metadata items
+            if (metadata) {
+                if (metadata.agent) {
+                    const agentLabel = metadata.agent === "job_search_agent" ? "Job Search" : "App Prep";
+                    metaBar.innerHTML += `<span class="meta-item" title="Routed agent">${agentLabel}</span>`;
+                }
+                if (metadata.classifier_confidence != null) {
+                    metaBar.innerHTML += `<span class="meta-item" title="Classifier confidence">${metadata.classifier_confidence}%</span>`;
+                }
+                if (metadata.usage) {
+                    const u = metadata.usage;
+                    metaBar.innerHTML += `<span class="meta-item" title="Token usage">${u.total_tokens} tok</span>`;
+                }
+                if (metadata.elapsed_ms != null) {
+                    const secs = (metadata.elapsed_ms / 1000).toFixed(1);
+                    metaBar.innerHTML += `<span class="meta-item" title="Response time">${secs}s</span>`;
+                }
+                if (metadata.tool_count != null && metadata.tool_count > 0) {
+                    metaBar.innerHTML += `<span class="meta-item" title="Tools used">${metadata.tool_count} tools</span>`;
+                }
+            }
+
+            // Feedback buttons
+            const fbDiv = document.createElement("div");
+            fbDiv.className = "feedback-btns";
+            fbDiv.innerHTML = `
+                <button class="fb-up" title="Good response" data-idx="${currentMsgIdx}">&#x1F44D;</button>
+                <button class="fb-down" title="Poor response" data-idx="${currentMsgIdx}">&#x1F44E;</button>
+            `;
+            metaBar.appendChild(fbDiv);
+            contentEl.appendChild(metaBar);
+
+            // Attach feedback click handlers
+            const upBtn = fbDiv.querySelector(".fb-up");
+            const downBtn = fbDiv.querySelector(".fb-down");
+            upBtn.addEventListener("click", () => sendFeedback(currentMsgIdx, "up", upBtn, downBtn));
+            downBtn.addEventListener("click", () => sendFeedback(currentMsgIdx, "down", upBtn, downBtn));
         }
 
         msgEl.appendChild(avatarEl);
@@ -119,6 +175,34 @@
         scrollToBottom();
 
         return msgEl;
+    }
+
+    // --- Feedback ---
+    async function sendFeedback(msgIndex, rating, upBtn, downBtn) {
+        // Disable both buttons
+        upBtn.classList.add("disabled");
+        downBtn.classList.add("disabled");
+
+        // Highlight the selected one
+        if (rating === "up") {
+            upBtn.classList.add("selected-up");
+        } else {
+            downBtn.classList.add("selected-down");
+        }
+
+        try {
+            await fetch(`${API_BASE}/api/feedback`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    session_id: sessionId,
+                    message_index: msgIndex,
+                    rating: rating,
+                }),
+            });
+        } catch (e) {
+            console.warn("Feedback submission failed:", e);
+        }
     }
 
     // --- Trace Rendering ---
@@ -196,7 +280,16 @@
 
             const data = await res.json();
             sessionId = data.session_id;
-            addMessage("assistant", data.response);
+
+            // Build metadata object for the response bar
+            const meta = {
+                usage: data.usage || null,
+                classifier_confidence: data.classifier_confidence,
+                elapsed_ms: data.elapsed_ms,
+                agent: data.agent || null,
+                tool_count: data.tool_count,
+            };
+            addMessage("assistant", data.response, meta);
 
             // Render traces if available
             if (data.traces && data.traces.length > 0) {
@@ -223,6 +316,7 @@
         }
 
         sessionId = null;
+        assistantMsgIndex = 0;
         messagesDiv.innerHTML = "";
         if (welcomeDiv) {
             welcomeDiv.style.display = "flex";
@@ -400,6 +494,190 @@
 
     // Load profiles on startup
     loadProfiles();
+
+    // --- Profile Modal Logic ---
+
+    function openProfileModal(profileId) {
+        profileForm.reset();
+        document.getElementById("pf-id").value = "";
+        pfResumeName.textContent = "No file chosen";
+        pfResumeName.classList.remove("has-file");
+        pfResumeInput.value = "";
+        hideResumeSummary();
+
+        if (profileId) {
+            document.getElementById("profile-modal-title").textContent = "Edit Profile";
+            fetchProfileAndPopulate(profileId);
+        } else {
+            document.getElementById("profile-modal-title").textContent = "New Profile";
+        }
+
+        profileModal.hidden = false;
+        document.getElementById("pf-name").focus();
+    }
+
+    function hideResumeSummary() {
+        document.getElementById("pf-resume-summary").hidden = true;
+    }
+
+    function showResumeSummary(profile) {
+        const section = document.getElementById("pf-resume-summary");
+        document.getElementById("pf-extracted-title").textContent = profile.current_title || "—";
+        document.getElementById("pf-extracted-years").textContent =
+            profile.years_experience != null ? `${profile.years_experience} years` : "—";
+        document.getElementById("pf-extracted-skills").textContent =
+            (profile.skills && profile.skills.length) ? profile.skills.join(", ") : "—";
+        document.getElementById("pf-extracted-summary").textContent = profile.summary || "—";
+        section.hidden = false;
+    }
+
+    function closeProfileModal() {
+        profileModal.hidden = true;
+    }
+
+    async function fetchProfileAndPopulate(profileId) {
+        try {
+            const res = await fetch(`${API_BASE}/api/profiles/${encodeURIComponent(profileId)}`);
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const p = await res.json();
+
+            document.getElementById("pf-id").value           = p.id || "";
+            document.getElementById("pf-name").value         = p.name || "";
+            document.getElementById("pf-email").value        = p.email || "";
+            document.getElementById("pf-desired").value      = (p.desired_titles || []).join(", ");
+            document.getElementById("pf-locations").value    = (p.preferred_locations || []).join(", ");
+            document.getElementById("pf-remote").value       = p.remote_preference || "";
+            document.getElementById("pf-salary").value       = p.min_salary ?? "";
+            document.getElementById("pf-industries").value   = (p.industries || []).join(", ");
+
+            // Show resume-extracted details as read-only summary
+            if (p.has_resume || p.skills?.length || p.current_title) {
+                showResumeSummary(p);
+            }
+
+            if (p.has_resume) {
+                pfResumeName.textContent = "Resume on file";
+                pfResumeName.classList.add("has-file");
+            }
+        } catch (e) {
+            console.error("Failed to load profile:", e);
+            addMessage("error", `Failed to load profile for editing: ${e.message}`);
+            closeProfileModal();
+        }
+    }
+
+    function parseCommaSeparated(val) {
+        return val.split(",").map(s => s.trim()).filter(Boolean);
+    }
+
+    async function saveProfile() {
+        pfSaveBtn.disabled = true;
+        pfSaveBtn.textContent = "Saving…";
+
+        try {
+            // If a new resume file was attached, upload it first
+            let resumeProfileId = null;
+            if (pfResumeInput.files.length > 0) {
+                const formData = new FormData();
+                formData.append("file", pfResumeInput.files[0]);
+                const uploadRes = await fetch(`${API_BASE}/api/upload-resume`, {
+                    method: "POST",
+                    body: formData,
+                });
+                if (!uploadRes.ok) throw new Error("Resume upload failed");
+                const uploadData = await uploadRes.json();
+                resumeProfileId = uploadData.profile_id;
+            }
+
+            const body = {
+                name:                document.getElementById("pf-name").value.trim(),
+                email:               document.getElementById("pf-email").value.trim() || null,
+                desired_titles:      parseCommaSeparated(document.getElementById("pf-desired").value),
+                preferred_locations: parseCommaSeparated(document.getElementById("pf-locations").value),
+                remote_preference:   document.getElementById("pf-remote").value || null,
+                min_salary:          parseInt(document.getElementById("pf-salary").value, 10) || null,
+                industries:          parseCommaSeparated(document.getElementById("pf-industries").value),
+            };
+
+            // Include profile ID if editing
+            const pfId = document.getElementById("pf-id").value;
+            if (pfId) body.id = pfId;
+            // If resume was uploaded in this save, use that profile's ID
+            if (resumeProfileId && !pfId) body.id = resumeProfileId;
+
+            const res = await fetch(`${API_BASE}/api/profiles/save`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(body),
+            });
+
+            if (!res.ok) {
+                const errData = await res.json().catch(() => ({}));
+                throw new Error(errData.detail || `HTTP ${res.status}`);
+            }
+
+            const saved = await res.json();
+            closeProfileModal();
+            await loadProfiles();
+
+            // Update badge
+            resumeBadge.hidden = false;
+            resumeName.textContent = saved.name;
+
+            addMessage("assistant", `Profile **${saved.name}** saved successfully! ${saved.skills_count} skills loaded.`);
+        } catch (e) {
+            console.error("Save profile error:", e);
+            addMessage("error", `Failed to save profile: ${e.message}`);
+        } finally {
+            pfSaveBtn.disabled = false;
+            pfSaveBtn.textContent = "Save Profile";
+        }
+    }
+
+    // --- Modal event listeners ---
+    profileEditBtn.addEventListener("click", () => {
+        const selectedId = profileSelect.value;
+        if (!selectedId) {
+            addMessage("error", "Select a profile first, or click **+ New** to create one.");
+            return;
+        }
+        openProfileModal(selectedId);
+    });
+
+    profileNewBtn.addEventListener("click", () => {
+        openProfileModal(null);
+    });
+
+    modalCloseBtn.addEventListener("click", closeProfileModal);
+    modalCancelBtn.addEventListener("click", closeProfileModal);
+
+    // Overlay click to close
+    profileModal.addEventListener("click", (e) => {
+        if (e.target === profileModal) closeProfileModal();
+    });
+
+    // Escape key to close
+    document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape" && !profileModal.hidden) closeProfileModal();
+    });
+
+    // Resume file pick
+    pfResumeBtn.addEventListener("click", () => pfResumeInput.click());
+    pfResumeInput.addEventListener("change", () => {
+        if (pfResumeInput.files.length > 0) {
+            pfResumeName.textContent = pfResumeInput.files[0].name;
+            pfResumeName.classList.add("has-file");
+        } else {
+            pfResumeName.textContent = "No file chosen";
+            pfResumeName.classList.remove("has-file");
+        }
+    });
+
+    // Handle form submit (covers both Save button click and Enter key)
+    profileForm.addEventListener("submit", (e) => {
+        e.preventDefault();
+        saveProfile();
+    });
 
     // Focus input on page load
     messageInput.focus();

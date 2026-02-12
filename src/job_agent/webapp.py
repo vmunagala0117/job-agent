@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import os
+import re
 import time
 import uuid
 from collections import deque
@@ -33,6 +35,7 @@ from agent_framework import ChatMessage, Role, TextContent
 
 from .clients import build_azure_openai_client
 from .config import AppConfig
+from .models import ResponseFeedback, ResponseRating
 from .workflows import create_agent
 
 logger = logging.getLogger(__name__)
@@ -132,6 +135,11 @@ class ChatResponse(BaseModel):
     response: str
     session_id: str
     traces: list[dict] = []
+    usage: dict | None = None  # {input_tokens, output_tokens, total_tokens}
+    classifier_confidence: float | None = None
+    elapsed_ms: int | None = None
+    agent: str | None = None
+    tool_count: int | None = None
 
 
 class HealthResponse(BaseModel):
@@ -168,7 +176,25 @@ async def lifespan(app: FastAPI):
 
     # --- OpenTelemetry ---
     from agent_framework.observability import configure_otel_providers
-    configure_otel_providers()
+
+    # Build list of exporters — add Azure Monitor if connection string is set
+    exporters = []
+    ai_conn_str = os.environ.get("APPLICATIONINSIGHTS_CONNECTION_STRING")
+    if ai_conn_str:
+        try:
+            from azure.monitor.opentelemetry.exporter import (
+                AzureMonitorLogExporter,
+                AzureMonitorMetricExporter,
+                AzureMonitorTraceExporter,
+            )
+            exporters.append(AzureMonitorTraceExporter(connection_string=ai_conn_str))
+            exporters.append(AzureMonitorMetricExporter(connection_string=ai_conn_str))
+            exporters.append(AzureMonitorLogExporter(connection_string=ai_conn_str))
+            logger.info("Azure Application Insights exporters configured")
+        except Exception as exc:
+            logger.warning("Could not configure App Insights exporters: %s", exc)
+
+    configure_otel_providers(exporters=exporters if exporters else None)
     logger.info("OpenTelemetry configured")
 
     logger.info("Initialising Job Agent...")
@@ -252,7 +278,20 @@ async def chat(req: ChatRequest):
 
     try:
         response = await _agent.run(session.messages)
-        assistant_text = response.text or "(No response)"
+        raw_text = response.text or "(No response)"
+
+        # Parse metadata suffix injected by the workflow
+        metadata = {}
+        _META_RE = re.compile(r"\n<!--METADATA:(\{.*?\})-->$", re.DOTALL)
+        match = _META_RE.search(raw_text)
+        if match:
+            try:
+                metadata = json.loads(match.group(1))
+            except json.JSONDecodeError:
+                pass
+            assistant_text = raw_text[: match.start()]
+        else:
+            assistant_text = raw_text
 
         # Append assistant message
         session.messages.append(
@@ -266,6 +305,11 @@ async def chat(req: ChatRequest):
             response=assistant_text,
             session_id=session.id,
             traces=traces,
+            usage=metadata.get("usage"),
+            classifier_confidence=metadata.get("classifier_confidence"),
+            elapsed_ms=metadata.get("elapsed_ms"),
+            agent=metadata.get("agent"),
+            tool_count=metadata.get("tool_count"),
         )
 
     except Exception as exc:
@@ -423,6 +467,182 @@ async def select_profile(profile_id: str):
         "title": profile.current_title or "",
         "skills": profile.skills[:12],
     }
+
+
+@app.get("/api/profiles/{profile_id}")
+async def get_profile_detail(profile_id: str):
+    """Return full profile details for the edit form."""
+    store = _services.get("store")
+    if not store:
+        raise HTTPException(status_code=503, detail="Store not available")
+    profile = await store.get_profile(profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    return {
+        "id": profile.id,
+        "name": profile.name,
+        "email": profile.email,
+        "current_title": profile.current_title,
+        "summary": profile.summary,
+        "skills": profile.skills,
+        "years_experience": profile.years_experience,
+        "desired_titles": profile.desired_titles,
+        "preferred_locations": profile.preferred_locations,
+        "remote_preference": profile.remote_preference,
+        "min_salary": profile.min_salary,
+        "industries": profile.industries,
+        "has_resume": bool(profile.resume_text),
+    }
+
+
+class ProfileSaveRequest(BaseModel):
+    id: str | None = None  # None = create new, set = update existing
+    name: str
+    email: str = ""
+    # Resume-extracted fields — not sent from the form; preserved from existing profile
+    current_title: str | None = None
+    summary: str | None = None
+    skills: list[str] | None = None
+    years_experience: int | None = None
+    # User preference fields — editable in the form
+    desired_titles: list[str] = []
+    preferred_locations: list[str] = []
+    remote_preference: str = "flexible"
+    min_salary: int | None = None
+    industries: list[str] = []
+
+
+@app.post("/api/profiles/save")
+async def save_profile(req: ProfileSaveRequest):
+    """Create or update a user profile from the profile form."""
+    from datetime import datetime
+    from .models import UserProfile
+    from .tools import set_current_profile
+
+    store = _services.get("store")
+    if not store:
+        raise HTTPException(status_code=503, detail="Store not available")
+
+    # If updating, load existing profile to preserve resume_text / embedding
+    existing = None
+    if req.id:
+        existing = await store.get_profile(req.id)
+
+    profile = UserProfile(
+        id=req.id or str(uuid.uuid4()),
+        name=req.name,
+        email=req.email,
+        # Resume-extracted fields: preserve from existing profile
+        current_title=existing.current_title if existing else (req.current_title or ""),
+        summary=existing.summary if existing else (req.summary or ""),
+        skills=existing.skills if existing else (req.skills or []),
+        years_experience=existing.years_experience if existing else req.years_experience,
+        # User preference fields: always take from form
+        desired_titles=req.desired_titles,
+        preferred_locations=req.preferred_locations,
+        remote_preference=req.remote_preference,
+        min_salary=req.min_salary,
+        industries=req.industries,
+        # Preserve resume content and embedding from existing profile
+        resume_text=existing.resume_text if existing else "",
+        embedding=existing.embedding if existing else None,
+        created_at=existing.created_at if existing else datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+
+    # Generate embedding from profile text if none exists
+    if not profile.embedding:
+        ranking_svc = _services.get("ranking")
+        if ranking_svc:
+            try:
+                profile = await ranking_svc.embed_user_profile(profile)
+            except Exception as exc:
+                logger.warning("Could not embed profile: %s", exc)
+
+    # Set as active and persist
+    set_current_profile(profile)
+    await store.save_profile(profile)
+
+    action = "updated" if existing else "created"
+    logger.info("Profile %s: %s (%s)", action, profile.name, profile.current_title)
+
+    return {
+        "status": "ok",
+        "action": action,
+        "id": profile.id,
+        "name": profile.name,
+        "title": profile.current_title,
+        "skills_count": len(profile.skills),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Response feedback (thumbs up/down)
+# ---------------------------------------------------------------------------
+
+# In-memory feedback store (swap for DB table in production)
+_response_feedback: list[ResponseFeedback] = []
+
+
+class FeedbackRequest(BaseModel):
+    session_id: str
+    message_index: int
+    rating: str  # "up" or "down"
+    comment: str | None = None
+
+
+@app.post("/api/feedback")
+async def submit_feedback(req: FeedbackRequest):
+    """Record thumbs up/down feedback on an agent response."""
+    try:
+        rating = ResponseRating(req.rating)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="rating must be 'up' or 'down'")
+
+    fb = ResponseFeedback(
+        session_id=req.session_id,
+        message_index=req.message_index,
+        rating=rating,
+        comment=req.comment,
+    )
+    _response_feedback.append(fb)
+
+    # Also emit an OTel span for the feedback event
+    try:
+        from opentelemetry import trace
+        tracer = trace.get_tracer("job_agent.feedback")
+        with tracer.start_as_current_span("response_feedback") as span:
+            span.set_attribute("feedback.session_id", req.session_id)
+            span.set_attribute("feedback.message_index", req.message_index)
+            span.set_attribute("feedback.rating", req.rating)
+            span.set_attribute("feedback.comment", req.comment or "")
+    except Exception:
+        pass  # OTel is optional
+
+    logger.info(
+        "Feedback recorded: session=%s msg=%d rating=%s",
+        req.session_id, req.message_index, req.rating,
+    )
+    return {"status": "ok", "id": fb.id}
+
+
+@app.get("/api/feedback")
+async def list_feedback(session_id: str | None = None):
+    """List recorded response feedback, optionally filtered by session."""
+    items = _response_feedback
+    if session_id:
+        items = [f for f in items if f.session_id == session_id]
+    return [
+        {
+            "id": f.id,
+            "session_id": f.session_id,
+            "message_index": f.message_index,
+            "rating": f.rating.value,
+            "comment": f.comment,
+            "created_at": f.created_at.isoformat(),
+        }
+        for f in items
+    ]
 
 
 @app.post("/api/chat/reset", response_model=SessionInfo)

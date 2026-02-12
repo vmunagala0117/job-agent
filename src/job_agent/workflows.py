@@ -12,7 +12,10 @@ Built with WorkflowBuilder (single-node executor that internally manages
 two sub-agents via programmatic routing).
 """
 
+import json
 import logging
+import math
+import time
 from typing import Any, Optional
 
 from agent_framework import (
@@ -25,6 +28,8 @@ from agent_framework import (
     handler,
 )
 from agent_framework.azure import AzureOpenAIChatClient
+from openai import AsyncAzureOpenAI
+from opentelemetry import trace
 
 from .application_prep import ApplicationPrepService, get_application_prep_service
 from .models import (
@@ -43,6 +48,7 @@ from .store import InMemoryJobStore, JobStore, get_store
 from .tools import get_current_profile, set_current_profile
 
 logger = logging.getLogger(__name__)
+_tracer = trace.get_tracer("job_agent.workflows")
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +79,18 @@ JOB_SEARCH_INSTRUCTIONS = """\
 You are a job search specialist. You help users find, rank, and manage job \
 opportunities.
 
+CRITICAL — ALWAYS CHECK PROFILE FIRST:
+- Before asking the user ANY questions, call get_profile() to load their \
+  existing profile and preferences.
+- The profile contains: desired_titles, preferred_locations, remote_preference, \
+  min_salary, industries, skills, current_title, and resume content.
+- Use these preferences directly for searches — do NOT re-ask for information \
+  that's already in the profile.
+- Only ask the user if essential preferences are genuinely missing from the \
+  profile (e.g., no desired_titles AND no current_title to infer from).
+- If the user says "search for jobs based on my preferences", you have \
+  everything you need in the profile — run the searches immediately.
+
 SEARCH TIPS:
 - For remote jobs: Use remote_only=True, NOT location="Remote"
 - For broader results: Try multiple search terms
@@ -92,8 +110,8 @@ RESUME HANDLING:
 - Use set_user_profile when user describes their background in text
 
 WORKFLOW:
-1. When user describes their background, save it with set_user_profile
-2. Search for jobs matching their interests
+1. Call get_profile() first to load existing preferences and resume
+2. Search for jobs using profile preferences (desired_titles, locations, etc.)
 3. Use rank_saved_jobs to show best matches
 4. Help track applications with mark_job_applied / mark_job_rejected
 5. Use send_job_notifications to deliver top matches
@@ -107,6 +125,9 @@ APP_PREP_INSTRUCTIONS = """\
 You are an application preparation specialist. You help users create tailored \
 application materials for specific jobs.
 
+IMPORTANT: Always call get_profile() first to load the user's full profile, \
+skills, experience, and resume before generating any materials.
+
 CAPABILITIES:
 - Analyze how well a user's profile matches a specific job
 - Generate targeted resume diff suggestions (not full rewrites)
@@ -115,9 +136,10 @@ CAPABILITIES:
 - Package all materials for review (prepare_application)
 
 WORKFLOW:
-1. If the user asks about a specific job, use analyze_job_fit first
-2. For complete application packages, use prepare_application
-3. To retrieve a previously created package, use get_application_package
+1. Call get_profile() to load the user's profile and resume
+2. If the user asks about a specific job, use analyze_job_fit first
+3. For complete application packages, use prepare_application
+4. To retrieve a previously created package, use get_application_package
 
 Be specific and actionable in your suggestions. Reference actual skills and \
 experience from the user's profile.
@@ -493,11 +515,7 @@ Description:
 - Profile Embedding: {'Ready' if profile.embedding else 'Not generated'}"""
 
         if profile.resume_text:
-            # Include the resume content (truncated for very long resumes)
-            resume_preview = profile.resume_text[:3000]
-            if len(profile.resume_text) > 3000:
-                resume_preview += f"\n\n... (truncated, {len(profile.resume_text)} total chars)"
-            result += f"\n\nResume Content:\n{resume_preview}"
+            result += f"\n\nResume Content:\n{profile.resume_text}"
 
         return result
 
@@ -774,9 +792,13 @@ class CoordinatorExecutor(Executor):
         ranking_service: RankingService,
         notification_service: NotificationService,
         application_prep_service: Optional[ApplicationPrepService] = None,
+        openai_client: Optional[AsyncAzureOpenAI] = None,
+        deployment_name: str = "",
         id: str = "coordinator",
     ):
         self.store = store
+        self._openai_client = openai_client  # Direct OpenAI client for logprobs
+        self._deployment = deployment_name
 
         # --- Tool objects ---
         job_tools = JobSearchTools(store, provider, ranking_service, notification_service)
@@ -842,6 +864,9 @@ class CoordinatorExecutor(Executor):
     async def handle(self, messages: list[ChatMessage], ctx: WorkflowContext[Any, Any]) -> None:
         await self._ensure_profile()
 
+        request_start = time.time()
+        usage_totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
         # Log the user's message for trace context
         user_msg = ""
         if messages:
@@ -853,56 +878,165 @@ class CoordinatorExecutor(Executor):
                         break
         logger.info("[TRACE] User message: %s", user_msg)
 
-        # 1. Classify intent with a lightweight LLM call
+        # 1. Classify intent — use direct OpenAI call for logprobs if available
         logger.info("[TRACE] Classifying user intent...")
-        classification = await self.classifier.run(messages)
-        intent = (classification.text or "").strip().upper()
-        logger.info("[TRACE] Classifier → %s", intent)
+        confidence = None
+        intent = "JOB_SEARCH"  # default
+
+        if self._openai_client and self._deployment:
+            try:
+                # Build condensed messages for classifier
+                classify_messages = [
+                    {"role": "system", "content": CLASSIFIER_INSTRUCTIONS},
+                ]
+                for m in messages[-3:]:  # last 3 for context
+                    role = "user" if m.role == Role.USER else "assistant"
+                    text = ""
+                    if m.contents:
+                        for c in m.contents:
+                            if hasattr(c, "text") and c.text:
+                                text = c.text
+                                break
+                    if text:
+                        classify_messages.append({"role": role, "content": text})
+
+                with _tracer.start_as_current_span("classifier") as span:
+                    resp = await self._openai_client.chat.completions.create(
+                        model=self._deployment,
+                        messages=classify_messages,
+                        logprobs=True,
+                        top_logprobs=3,
+                        max_completion_tokens=150,
+                    )
+                    choice = resp.choices[0]
+                    intent = (choice.message.content or "JOB_SEARCH").strip().upper()
+
+                    # Extract confidence from logprobs
+                    if choice.logprobs and choice.logprobs.content:
+                        first_token = choice.logprobs.content[0]
+                        confidence = round(math.exp(first_token.logprob) * 100, 1)
+                        # Log alternatives
+                        alternatives = []
+                        for alt in first_token.top_logprobs:
+                            alt_prob = round(math.exp(alt.logprob) * 100, 1)
+                            alternatives.append(f"{alt.token}={alt_prob}%")
+                        span.set_attribute("classifier.alternatives", ", ".join(alternatives))
+
+                    # Track classifier token usage
+                    if resp.usage:
+                        usage_totals["input_tokens"] += resp.usage.prompt_tokens
+                        usage_totals["output_tokens"] += resp.usage.completion_tokens
+                        usage_totals["total_tokens"] += resp.usage.total_tokens
+
+                    span.set_attribute("classifier.intent", intent)
+                    span.set_attribute("classifier.confidence_pct", confidence or 0)
+                    span.set_attribute("classifier.user_message", user_msg[:200])
+
+            except Exception as exc:
+                logger.warning("[TRACE] Logprobs classifier failed, falling back: %s", exc)
+                classification = await self.classifier.run(messages)
+                intent = (classification.text or "").strip().upper()
+        else:
+            classification = await self.classifier.run(messages)
+            intent = (classification.text or "").strip().upper()
+
+        conf_str = f" (confidence: {confidence}%)" if confidence is not None else ""
+        logger.info("[TRACE] Classifier → %s%s", intent, conf_str)
 
         # 2. Route to the appropriate specialist
-        if "APP_PREP" in intent:
-            agent_name = "application_prep_agent"
-            logger.info("[TRACE] Routing to Application Prep Agent (3 tools)")
-            response = await self.app_prep_agent.run(messages)
-        else:
-            agent_name = "job_search_agent"
-            logger.info("[TRACE] Routing to Job Search Agent (11 tools)")
-            response = await self.job_search_agent.run(messages)
+        with _tracer.start_as_current_span("specialist_agent") as agent_span:
+            if "APP_PREP" in intent:
+                agent_name = "application_prep_agent"
+                logger.info("[TRACE] Routing to Application Prep Agent (3 tools)")
+                response = await self.app_prep_agent.run(messages)
+            else:
+                agent_name = "job_search_agent"
+                logger.info("[TRACE] Routing to Job Search Agent (11 tools)")
+                response = await self.job_search_agent.run(messages)
 
-        # 3. Log tool calls with arguments and results
+            agent_span.set_attribute("agent.name", agent_name)
+            agent_span.set_attribute("agent.intent", intent)
+
+        # Track specialist agent token usage
+        if hasattr(response, "usage_details") and response.usage_details:
+            ud = response.usage_details
+            in_tok = getattr(ud, "input_token_count", 0) or 0
+            out_tok = getattr(ud, "output_token_count", 0) or 0
+            tot_tok = getattr(ud, "total_token_count", 0) or 0
+            usage_totals["input_tokens"] += in_tok
+            usage_totals["output_tokens"] += out_tok
+            usage_totals["total_tokens"] += tot_tok
+
+        # 3. Audit log — structured OTel spans for each tool call
+        tool_calls = []
         for message in response.messages:
             if not message.contents:
                 continue
             for c in message.contents:
                 if hasattr(c, "function_name"):
-                    # Tool call request
+                    tool_name = c.function_name
                     args_str = ""
                     if hasattr(c, "arguments") and c.arguments:
-                        args_str = str(c.arguments)[:200]
-                    logger.info("[TRACE] 🔧 Tool call: %s(%s)", c.function_name, args_str)
+                        args_str = str(c.arguments)[:500]
+
+                    # Find the matching tool result
+                    tool_result = ""
+                    tool_call_id = getattr(c, "id", None)
+                    if tool_call_id:
+                        for rm in response.messages:
+                            if rm.contents:
+                                for rc in rm.contents:
+                                    if getattr(rc, "tool_call_id", None) == tool_call_id:
+                                        tool_result = (getattr(rc, "text", "") or "")[:500]
+                                        break
+
+                    # Emit structured audit span
+                    with _tracer.start_as_current_span("tool_call") as tool_span:
+                        tool_span.set_attribute("tool.name", tool_name)
+                        tool_span.set_attribute("tool.arguments", args_str)
+                        tool_span.set_attribute("tool.result_preview", tool_result[:300])
+                        tool_span.set_attribute("tool.agent", agent_name)
+                        tool_span.set_attribute("audit.type", "tool_invocation")
+
+                    tool_calls.append(tool_name)
+                    logger.info("[TRACE] 🔧 Tool call: %s(%s)", tool_name, args_str[:200])
+
                 elif hasattr(c, "tool_call_id") and hasattr(c, "text"):
-                    # Tool result
                     result_preview = (c.text or "")[:150]
                     logger.info("[TRACE] ← Tool result: %s", result_preview)
 
         # Summarize tool flow
-        tool_calls = []
-        for message in response.messages:
-            if message.contents:
-                for c in message.contents:
-                    if hasattr(c, "function_name"):
-                        tool_calls.append(c.function_name)
         if tool_calls:
             logger.info("[TRACE] Tool chain: %s", " → ".join(tool_calls))
         else:
             logger.info("[TRACE] %s responded without tool calls", agent_name)
 
+        # Token usage summary
+        elapsed_ms = round((time.time() - request_start) * 1000)
+        logger.info(
+            "[TRACE] Tokens: %d in + %d out = %d total | %dms",
+            usage_totals["input_tokens"],
+            usage_totals["output_tokens"],
+            usage_totals["total_tokens"],
+            elapsed_ms,
+        )
+
         logger.info("[TRACE] Response length: %d chars", len(response.text or ""))
 
-        # 4. Yield final text for the HTTP response body
-        #    (Do NOT also emit add_event — that causes duplicate output
-        #     because WorkflowAgent.run() collects both events and yield_output)
-        await ctx.yield_output(response.text)
+        # 4. Yield final text + metadata for the HTTP response body
+        #    Pack usage and confidence into a JSON metadata suffix that
+        #    the webapp will parse and strip before rendering.
+        metadata = {
+            "usage": usage_totals,
+            "elapsed_ms": elapsed_ms,
+            "classifier_confidence": confidence,
+            "agent": agent_name,
+            "tool_count": len(tool_calls),
+        }
+        response_text = response.text or ""
+        # Append metadata as a parseable suffix
+        output = f"{response_text}\n<!--METADATA:{json.dumps(metadata)}-->"
+        await ctx.yield_output(output)
 
 
 # ---------------------------------------------------------------------------
@@ -936,6 +1070,8 @@ def build_agent(
     ranking_service: Optional[RankingService] = None,
     notification_service: Optional[NotificationService] = None,
     application_prep_service: Optional[ApplicationPrepService] = None,
+    openai_client: Optional[AsyncAzureOpenAI] = None,
+    deployment_name: str = "",
 ):
     """Build the multi-agent job workflow (sync, for testing).
 
@@ -946,6 +1082,8 @@ def build_agent(
         ranking_service: Ranking / embedding service.
         notification_service: Notification delivery service.
         application_prep_service: Application material generator.
+        openai_client: Direct AsyncAzureOpenAI client for logprobs-based classification.
+        deployment_name: Azure OpenAI deployment name for the direct client.
     """
     if store is None:
         store = InMemoryJobStore()
@@ -964,6 +1102,8 @@ def build_agent(
             lambda: CoordinatorExecutor(
                 client, store, provider, ranking_service,
                 notification_service, application_prep_service,
+                openai_client=openai_client,
+                deployment_name=deployment_name,
             ),
             name="coordinator",
         )
@@ -981,7 +1121,7 @@ async def create_agent(
 
     Architecture:
         CoordinatorExecutor
-          ├── classifier            (lightweight intent routing)
+          ├── classifier            (lightweight intent routing with logprobs)
           ├── job_search_agent      (11 tools — search, rank, profile, etc.)
           └── application_prep_agent (3 tools — resume, cover letter, email)
 
@@ -996,8 +1136,36 @@ async def create_agent(
         await _init_services(use_database)
     )
 
+    # Build a direct AsyncAzureOpenAI client for logprobs-based classification
+    import os
+    openai_client = None
+    deployment_name = ""
+    try:
+        from .config import AppConfig
+        config = AppConfig.load()
+        oc = config.azure_openai
+        deployment_name = oc.deployment_name
+        if oc.api_key:
+            openai_client = AsyncAzureOpenAI(
+                azure_endpoint=oc.endpoint,
+                api_key=oc.api_key,
+                api_version=oc.api_version,
+            )
+        else:
+            from azure.identity.aio import DefaultAzureCredential as AsyncCredential
+            openai_client = AsyncAzureOpenAI(
+                azure_endpoint=oc.endpoint,
+                azure_ad_token_provider=AsyncCredential(),
+                api_version=oc.api_version,
+            )
+        logger.info("Direct OpenAI client created for logprobs classification")
+    except Exception as exc:
+        logger.warning("Could not create direct OpenAI client (logprobs disabled): %s", exc)
+
     agent = build_agent(
         client, store, provider, ranking_service,
         notification_service, app_prep_service,
+        openai_client=openai_client,
+        deployment_name=deployment_name,
     )
     return agent, store, ranking_service
