@@ -1,0 +1,30 @@
+{"query": "Find remote Python developer jobs paying over 150k", "expected_agent": "job_search_agent", "expected_tools": ["search_jobs"], "category": "job_search"}
+{"query": "What AI engineering jobs are available in San Francisco?", "expected_agent": "job_search_agent", "expected_tools": ["search_jobs"], "category": "job_search"}
+{"query": "Search for senior data scientist positions in New York", "expected_agent": "job_search_agent", "expected_tools": ["search_jobs"], "category": "job_search"}
+{"query": "Show me remote machine learning jobs posted this week", "expected_agent": "job_search_agent", "expected_tools": ["search_jobs"], "category": "job_search"}
+{"query": "Find DevOps engineer roles with Kubernetes experience", "expected_agent": "job_search_agent", "expected_tools": ["search_jobs"], "category": "job_search"}
+{"query": "List all saved jobs", "expected_agent": "job_search_agent", "expected_tools": ["list_saved_jobs"], "category": "job_search"}
+{"query": "Rank my saved jobs based on my profile", "expected_agent": "job_search_agent", "expected_tools": ["rank_saved_jobs"], "category": "job_search"}
+{"query": "Mark job abc123 as applied", "expected_agent": "job_search_agent", "expected_tools": ["mark_job_applied"], "category": "job_search"}
+{"query": "What's the job market like for cloud architects?", "expected_agent": "job_search_agent", "expected_tools": ["search_jobs"], "category": "job_search"}
+{"query": "Search for backend engineer jobs that were posted yesterday", "expected_agent": "job_search_agent", "expected_tools": ["search_jobs"], "category": "job_search"}
+{"query": "My name is Alice, I'm a senior ML engineer with 8 years Python experience", "expected_agent": "job_search_agent", "expected_tools": ["set_user_profile"], "category": "profile_setup"}
+{"query": "Upload my resume from C:\\Users\\test\\resume.pdf", "expected_agent": "job_search_agent", "expected_tools": ["upload_resume"], "category": "profile_setup"}
+{"query": "Send me notifications about top matching jobs", "expected_agent": "job_search_agent", "expected_tools": ["send_job_notifications"], "category": "notification"}
+{"query": "Hello, how are you?", "expected_agent": "job_search_agent", "expected_tools": [], "category": "greeting"}
+{"query": "What can you help me with?", "expected_agent": "job_search_agent", "expected_tools": [], "category": "greeting"}
+{"query": "Help me write a cover letter for the senior engineer position at Google", "expected_agent": "application_prep_agent", "expected_tools": ["prepare_application"], "category": "app_prep"}
+{"query": "Can you tailor my resume for this data scientist role?", "expected_agent": "application_prep_agent", "expected_tools": ["prepare_application"], "category": "app_prep"}
+{"query": "Generate an intro email for the hiring manager at Microsoft", "expected_agent": "application_prep_agent", "expected_tools": ["prepare_application"], "category": "app_prep"}
+{"query": "How well does my profile match this job posting?", "expected_agent": "application_prep_agent", "expected_tools": ["analyze_job_fit"], "category": "app_prep"}
+{"query": "Prepare a complete application package for job abc123", "expected_agent": "application_prep_agent", "expected_tools": ["prepare_application"], "category": "app_prep"}
+{"query": "Draft a cover letter emphasizing my Python and AWS experience", "expected_agent": "application_prep_agent", "expected_tools": ["prepare_application"], "category": "app_prep"}
+{"query": "What resume changes should I make for this machine learning role?", "expected_agent": "application_prep_agent", "expected_tools": ["prepare_application"], "category": "app_prep"}
+{"query": "Analyze how my skills match the requirements for this position", "expected_agent": "application_prep_agent", "expected_tools": ["analyze_job_fit"], "category": "app_prep"}
+{"query": "Get my saved application package", "expected_agent": "application_prep_agent", "expected_tools": ["get_application_package"], "category": "app_prep"}
+{"query": "Write me an email to introduce myself to the recruiter", "expected_agent": "application_prep_agent", "expected_tools": ["prepare_application"], "category": "app_prep"}
+{"query": "Search for jobs based on my preferences", "expected_agent": "job_search_agent", "expected_tools": ["get_profile", "search_jobs"], "category": "job_search"}
+{"query": "Find full-stack developer positions near Seattle that are hybrid", "expected_agent": "job_search_agent", "expected_tools": ["search_jobs"], "category": "job_search"}
+{"query": "Show me details for job 5f3a2c1b", "expected_agent": "job_search_agent", "expected_tools": ["get_job_details"], "category": "job_search"}
+{"query": "I'm not interested in job xyz789, reject it", "expected_agent": "job_search_agent", "expected_tools": ["mark_job_rejected"], "category": "job_search"}
+{"query": "This job is a good fit, save my feedback", "expected_agent": "job_search_agent", "expected_tools": ["provide_feedback"], "category": "job_search"}

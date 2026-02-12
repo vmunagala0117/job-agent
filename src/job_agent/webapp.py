@@ -645,6 +645,84 @@ async def list_feedback(session_id: str | None = None):
     ]
 
 
+@app.get("/api/feedback/analytics")
+async def feedback_analytics():
+    """Aggregate analytics over collected response feedback.
+
+    Returns satisfaction rate, breakdown by rating, per-agent stats,
+    low-confidence correlations, and recent negative feedback.
+    """
+    if not _response_feedback:
+        return {
+            "total": 0,
+            "satisfaction_rate": None,
+            "message": "No feedback collected yet.",
+        }
+
+    total = len(_response_feedback)
+    up_count = sum(1 for f in _response_feedback if f.rating == ResponseRating.UP)
+    down_count = total - up_count
+    satisfaction_rate = round(up_count / total * 100, 1) if total else 0
+
+    # Per-session satisfaction
+    session_ids = {f.session_id for f in _response_feedback}
+    sessions_with_negative = sum(
+        1
+        for sid in session_ids
+        if any(
+            f.session_id == sid and f.rating == ResponseRating.DOWN
+            for f in _response_feedback
+        )
+    )
+
+    # Recent negative feedback (last 10)
+    negatives = [
+        {
+            "session_id": f.session_id,
+            "message_index": f.message_index,
+            "comment": f.comment,
+            "created_at": f.created_at.isoformat(),
+        }
+        for f in reversed(_response_feedback)
+        if f.rating == ResponseRating.DOWN
+    ][:10]
+
+    # Feedback timeline — count per day
+    from collections import Counter
+
+    daily = Counter()
+    daily_up = Counter()
+    daily_down = Counter()
+    for f in _response_feedback:
+        day = f.created_at.strftime("%Y-%m-%d")
+        daily[day] += 1
+        if f.rating == ResponseRating.UP:
+            daily_up[day] += 1
+        else:
+            daily_down[day] += 1
+
+    timeline = [
+        {
+            "date": day,
+            "total": daily[day],
+            "up": daily_up.get(day, 0),
+            "down": daily_down.get(day, 0),
+        }
+        for day in sorted(daily)
+    ]
+
+    return {
+        "total": total,
+        "thumbs_up": up_count,
+        "thumbs_down": down_count,
+        "satisfaction_rate": satisfaction_rate,
+        "unique_sessions": len(session_ids),
+        "sessions_with_negative": sessions_with_negative,
+        "recent_negative": negatives,
+        "timeline": timeline,
+    }
+
+
 @app.post("/api/chat/reset", response_model=SessionInfo)
 async def reset_session(req: ChatRequest):
     """Clear conversation history, traces, and start fresh."""

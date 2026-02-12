@@ -77,6 +77,7 @@ The system uses **classifier-based routing** — a lightweight LLM call with log
 | **Feedback** | Thumbs up/down on responses, per-job feedback (good fit, not relevant, tailor resume, etc.) |
 | **Persistence** | PostgreSQL + pgvector for jobs, profiles, feedback, application packages |
 | **Observability** | OpenTelemetry → Azure Application Insights, structured audit spans, classifier confidence tracking |
+| **Evaluation** | Azure AI Evaluation SDK (relevance, groundedness, coherence, fluency), classifier accuracy suite, feedback analytics |
 | **Web UI** | Chat interface, profile modal, resume upload, collapsible trace panel, feedback buttons |
 
 ## Project Structure
@@ -104,6 +105,13 @@ src/job_agent/
 docs/
 ├── TECHNICAL.md         # Internal code flow and architecture details
 └── kql-queries.kql      # 14 ready-to-run Application Insights queries
+
+evals/
+├── eval_classifier.py         # Classification accuracy evaluation
+├── eval_response_quality.py   # LLM-as-judge (relevance, groundedness, coherence, fluency)
+├── evaluators.py              # Custom code-based evaluators
+├── golden_dataset.jsonl       # 30 labeled queries with expected routing
+└── response_quality_dataset.jsonl  # Agent responses with tool context
 
 scripts/
 ├── init_db.py           # Database schema initialization
@@ -197,6 +205,7 @@ Open [http://localhost:8000](http://localhost:8000) for the web UI.
 | `POST` | `/api/profiles/select` | Switch active profile |
 | `POST` | `/api/feedback` | Thumbs up/down on response |
 | `GET` | `/api/feedback` | List feedback entries |
+| `GET` | `/api/feedback/analytics` | Feedback aggregate analytics |
 | `GET` | `/api/traces` | Get trace log for session |
 | `POST` | `/api/chat/reset` | Reset conversation |
 
@@ -237,6 +246,34 @@ The agent understands natural language:
 6. **Salary Match** (10%) — Min salary comparison
 7. **Composite Score** — Weighted 0–100%
 
+## Evaluation
+
+The `evals/` directory provides automated quality assessment:
+
+| Evaluator | Type | What It Measures |
+|-----------|------|------------------|
+| **Relevance** | LLM-as-judge | Does the response address the user's question? |
+| **Groundedness** | LLM-as-judge | Are claims backed by tool results (not hallucinated)? |
+| **Coherence** | LLM-as-judge | Is the response well-structured and logical? |
+| **Fluency** | LLM-as-judge | Is the language grammatically correct? |
+| **Classification Accuracy** | Custom | Does the classifier route to the correct agent? |
+| **Tool Usage** | Custom | Were the expected tools invoked? |
+| **Response Length** | Custom | Is the response long enough to be useful? |
+
+**Run evaluations:**
+
+```bash
+# Classification accuracy (calls Azure OpenAI, ~30 queries)
+python evals/eval_classifier.py --verbose
+
+# Response quality (LLM-as-judge via Azure AI Evaluation SDK)
+python evals/eval_response_quality.py
+```
+
+Results are saved to `evals/results/`. The classifier test exits non-zero if accuracy falls below 90%.
+
+**Feedback analytics** are available at `GET /api/feedback/analytics` — returns satisfaction rate, thumbs up/down breakdown, daily timeline, and recent negative feedback.
+
 ## Observability
 
 The system emits structured OpenTelemetry spans to Azure Application Insights:
@@ -266,6 +303,7 @@ See [docs/kql-queries.kql](docs/kql-queries.kql) for 14 ready-to-run KQL queries
 
 - **[docs/TECHNICAL.md](docs/TECHNICAL.md)** — Internal code flow, request lifecycle, module reference, design decisions
 - **[docs/kql-queries.kql](docs/kql-queries.kql)** — Application Insights KQL queries for monitoring
+- **[evals/](evals/)** — Evaluation harness: golden datasets, LLM-as-judge, classifier accuracy
 
 ## Roadmap
 
@@ -281,6 +319,8 @@ See [docs/kql-queries.kql](docs/kql-queries.kql) for 14 ready-to-run KQL queries
 - [x] Enterprise monitoring (OpenTelemetry → Azure Application Insights)
 - [x] Classifier confidence scoring (logprobs)
 - [x] Structured audit logging (tool-level OTel spans)
+- [x] Evaluation framework (Azure AI Evaluation SDK + custom evaluators)
+- [x] Feedback analytics (satisfaction rate, timelines, negative feedback)
 - [ ] Recruiter search integration
 - [ ] Scheduled job ingestion (cron-based auto-search)
-- [ ] Evaluation and tracing (pytest-agent-evals)
+- [ ] CI regression suite (golden dataset in pipeline)

@@ -445,6 +445,90 @@ See `docs/kql-queries.kql` for 14 ready-to-run KQL queries covering:
 
 ---
 
+## Evaluation Framework
+
+The `evals/` directory provides automated quality assessment using the
+**Azure AI Evaluation SDK** and custom code-based evaluators.
+
+### Architecture
+
+```
+evals/
+├── golden_dataset.jsonl           # 30 labeled queries (expected agent + tools)
+├── response_quality_dataset.jsonl  # Agent responses with tool result context
+├── eval_classifier.py             # Classification accuracy evaluation
+├── eval_response_quality.py       # LLM-as-judge (unified evaluate() API)
+├── evaluators.py                  # Custom evaluators (code-based)
+└── results/                       # Output reports (JSON, per-row data)
+```
+
+### LLM-as-Judge Evaluators (Built-in)
+
+Uses the Azure AI Evaluation SDK's `evaluate()` API with four built-in evaluators:
+
+| Evaluator | What It Measures | Required Data |
+|-----------|-----------------|---------------|
+| `RelevanceEvaluator` | Does the response address the user's question? | query, response |
+| `GroundednessEvaluator` | Are claims backed by tool results (not hallucinated)? | response, context |
+| `CoherenceEvaluator` | Is the response well-structured and logical? | query, response |
+| `FluencyEvaluator` | Is the language grammatically correct? | response |
+
+These evaluators use the same Azure OpenAI deployment as the agent. Results
+include per-row scores (1–5) and aggregate means.
+
+### Custom Code-Based Evaluators
+
+`evals/evaluators.py` defines three evaluators compatible with the `evaluate()` API:
+
+| Evaluator | Score | Description |
+|-----------|-------|-------------|
+| `ResponseLengthEvaluator` | 0.0 / 0.5 / 1.0 | Flags responses < 50 chars (failure) or < 100 chars (marginal) |
+| `ToolUsageEvaluator` | 0.0 – 1.0 | Recall: what fraction of expected tools were actually invoked |
+| `ClassificationEvaluator` | 0.0 / 1.0 | Binary: did the classifier route to the correct agent? |
+
+### Classifier Accuracy Test Suite
+
+`evals/eval_classifier.py` runs the production logprobs classifier against 30 labeled
+queries from `golden_dataset.jsonl`:
+
+1. Sends each query through the exact same classifier prompt + model
+2. Extracts the predicted intent and logprobs confidence
+3. Compares against the expected agent label
+4. Produces a confusion matrix, misclassification report, and JSON results
+5. Exits non-zero if accuracy < 90% (CI gate)
+
+### Feedback Analytics
+
+`GET /api/feedback/analytics` aggregates thumbs up/down data:
+
+```json
+{
+  "total": 42,
+  "thumbs_up": 38,
+  "thumbs_down": 4,
+  "satisfaction_rate": 90.5,
+  "unique_sessions": 12,
+  "sessions_with_negative": 3,
+  "recent_negative": [...],
+  "timeline": [{"date": "2026-02-11", "total": 5, "up": 4, "down": 1}]
+}
+```
+
+### Running Evaluations
+
+```bash
+# Classification accuracy (calls Azure OpenAI, ~30 queries)
+python evals/eval_classifier.py --verbose
+
+# Response quality (LLM-as-judge, ~6 responses)
+python evals/eval_response_quality.py
+
+# Custom dataset
+python evals/eval_response_quality.py --dataset evals/my_data.jsonl
+```
+
+---
+
 ## Module Reference
 
 ### config.py
