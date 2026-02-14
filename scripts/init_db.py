@@ -129,9 +129,13 @@ async def init_database():
                 min_salary INTEGER,
                 industries JSONB DEFAULT '[]',
                 embedding vector(1536),
+                cron_enabled BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+            
+            -- Add cron_enabled column if it doesn't exist (for existing DBs)
+            ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS cron_enabled BOOLEAN DEFAULT FALSE;
             
             -- Feedback table for user feedback on job matches
             CREATE TABLE IF NOT EXISTS feedback (
@@ -154,6 +158,21 @@ async def init_database():
                 status VARCHAR(50) DEFAULT 'draft',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            -- Automated search runs table (cron job history)
+            CREATE TABLE IF NOT EXISTS job_search_runs (
+                id VARCHAR(36) PRIMARY KEY,
+                profile_id VARCHAR(36) REFERENCES user_profiles(id) ON DELETE SET NULL,
+                profile_name VARCHAR(255),
+                search_keywords JSONB DEFAULT '[]',
+                jobs_found INTEGER DEFAULT 0,
+                top_matches JSONB DEFAULT '[]',
+                notification_channels JSONB DEFAULT '[]',
+                status VARCHAR(50) DEFAULT 'running',
+                error_message TEXT,
+                duration_ms INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
         
@@ -179,6 +198,11 @@ async def init_database():
             CREATE INDEX IF NOT EXISTS idx_packages_profile_id ON application_packages(profile_id);
             CREATE INDEX IF NOT EXISTS idx_packages_status ON application_packages(status);
             CREATE INDEX IF NOT EXISTS idx_packages_created_at ON application_packages(created_at DESC);
+
+            -- Search runs indexes
+            CREATE INDEX IF NOT EXISTS idx_search_runs_created ON job_search_runs(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_search_runs_profile ON job_search_runs(profile_id);
+            CREATE INDEX IF NOT EXISTS idx_search_runs_status ON job_search_runs(status);
         """)
         
         # Create vector index only if there are jobs with embeddings

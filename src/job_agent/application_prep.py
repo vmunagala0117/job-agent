@@ -309,7 +309,8 @@ Write the email now (include subject line):"""
         lines = [
             f"📋 APPLICATION PACKAGE",
             f"{'=' * 50}",
-            f"Job: {package.job.title} at {package.job.company}",
+            f"Job: {package.job.title} at {package.job.company}"
+            + (f" | 🔗 {package.job.url}" if package.job.url else ""),
             f"Status: {package.status}",
             f"Created: {package.created_at.strftime('%Y-%m-%d %H:%M')}",
             "",

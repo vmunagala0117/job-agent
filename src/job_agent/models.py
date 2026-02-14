@@ -81,10 +81,34 @@ class JobSearchCriteria:
     location: Optional[str] = None
     remote_only: bool = False
     min_salary: Optional[int] = None
-    max_results: int = 20
+    max_results: int = 30
     date_posted: DatePosted = DatePosted.ANY  # Date filter
     experience_levels: list[str] = field(default_factory=list)
     required_skills: list[str] = field(default_factory=list)
+
+
+class SearchRunStatus(Enum):
+    """Status of an automated search run."""
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+@dataclass
+class SearchRun:
+    """Record of an automated (cron) job search run."""
+
+    id: str = field(default_factory=lambda: str(uuid4()))
+    profile_id: str = ""
+    profile_name: str = ""
+    search_keywords: list[str] = field(default_factory=list)
+    jobs_found: int = 0
+    top_matches: list[dict] = field(default_factory=list)  # [{id, title, company, score, url}]
+    notification_channels: list[str] = field(default_factory=list)  # package IDs generated during cron
+    status: SearchRunStatus = SearchRunStatus.RUNNING
+    error_message: Optional[str] = None
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    duration_ms: Optional[int] = None
 
 
 @dataclass
@@ -113,6 +137,10 @@ class UserProfile:
     
     # Embedding (stored for similarity matching)
     embedding: Optional[list[float]] = None
+    
+    # Cron opt-in: only profiles with cron_enabled=True are processed
+    # by the automated daily search.
+    cron_enabled: bool = False
     
     # Timestamps
     created_at: datetime = field(default_factory=datetime.utcnow)

@@ -19,6 +19,17 @@
             "module": "job_agent.server"
         },
         {
+            "name": "Debug: Cron Job Test",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/test_cron.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            }
+        },
+        {
             "name": "Debug: CLI Test",
             "type": "debugpy",
             "request": "launch",

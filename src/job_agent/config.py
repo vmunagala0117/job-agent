@@ -122,16 +122,42 @@ class DatabaseConfig:
 
 
 @dataclass
+class CronConfig:
+    """Configuration for automated daily job search."""
+    enabled: bool = False
+    schedule: str = "0 6 * * *"  # cron expression: default 6 AM daily
+    api_key: str = ""  # Shared secret for X-Cron-Key header
+    app_url: str = "http://localhost:8080"  # Base URL of the running webapp
+
+    @classmethod
+    def from_env(cls) -> "CronConfig":
+        load_dotenv(override=True)
+        return cls(
+            enabled=os.getenv("CRON_ENABLED", "false").strip().lower() in ("true", "1", "yes"),
+            schedule=os.getenv("CRON_SCHEDULE", "0 6 * * *").strip(),
+            api_key=os.getenv("CRON_API_KEY", "").strip(),
+            app_url=os.getenv("CRON_APP_URL", "http://localhost:8080").strip(),
+        )
+
+    @property
+    def is_configured(self) -> bool:
+        return self.enabled and bool(self.api_key)
+
+
+@dataclass
 class AppConfig:
     azure_openai: AzureOpenAIConfig
     serpapi: SerpAPIConfig
     database: Optional[DatabaseConfig] = None
+    cron: Optional[CronConfig] = None
 
     @classmethod
     def load(cls) -> "AppConfig":
         db_config = DatabaseConfig.from_env()
+        cron_config = CronConfig.from_env()
         return cls(
             azure_openai=AzureOpenAIConfig.from_env(),
             serpapi=SerpAPIConfig.from_env(),
             database=db_config if db_config.is_configured else None,
+            cron=cron_config if cron_config.is_configured else None,
         )

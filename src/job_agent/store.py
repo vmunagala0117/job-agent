@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import TYPE_CHECKING, Optional
 
-from .models import ApplicationPackage, FeedbackType, Job, JobFeedback, JobSearchCriteria, JobStatus, UserProfile
+from .models import ApplicationPackage, FeedbackType, Job, JobFeedback, JobSearchCriteria, JobStatus, SearchRun, SearchRunStatus, UserProfile
 
 if TYPE_CHECKING:
     from .config import DatabaseConfig
@@ -69,10 +69,22 @@ class JobStore(ABC):
         """List all user profiles, most recently updated first."""
         return []
 
+    async def list_cron_profiles(self) -> list[UserProfile]:
+        """List profiles that have cron_enabled=True and a resume."""
+        return []
+
+    async def set_cron_enabled(self, profile_id: str, enabled: bool) -> bool:
+        """Toggle cron_enabled flag for a profile. Returns success."""
+        return False
+
     async def update_job_embeddings(self, job_embeddings: list[tuple[str, list[float]]]) -> int:
         """Update embeddings for multiple jobs. Returns count of updated jobs."""
         return 0
-    
+
+    async def update_job_scores(self, job_scores: list[tuple[str, float]]) -> int:
+        """Update scores for multiple jobs. Returns count of updated jobs."""
+        return 0
+
     async def get_jobs_without_embeddings(self, limit: int = 100) -> list[Job]:
         """Get jobs that don't have embeddings yet."""
         return []
@@ -103,6 +115,23 @@ class JobStore(ABC):
         """List application packages, optionally filtered by status."""
         return []
 
+    # Search run methods (for cron / automated searches)
+    async def save_search_run(self, run: SearchRun) -> SearchRun:
+        """Save an automated search run record."""
+        return run
+
+    async def get_search_run(self, run_id: str) -> Optional[SearchRun]:
+        """Get a search run by ID."""
+        return None
+
+    async def list_search_runs(self, limit: int = 50) -> list[SearchRun]:
+        """List search runs, most recent first."""
+        return []
+
+    async def update_search_run(self, run: SearchRun) -> SearchRun:
+        """Update an existing search run (e.g. mark completed)."""
+        return run
+
 
 class InMemoryJobStore(JobStore):
     """Simple in-memory job store for development and testing."""
@@ -112,6 +141,7 @@ class InMemoryJobStore(JobStore):
         self._profiles: dict[str, UserProfile] = {}
         self._feedback: dict[str, list[JobFeedback]] = {}  # job_id -> feedback list
         self._packages: dict[str, ApplicationPackage] = {}
+        self._search_runs: dict[str, SearchRun] = {}
         self._default_profile_id: Optional[str] = None
     
     async def add(self, job: Job) -> Job:
@@ -202,6 +232,21 @@ class InMemoryJobStore(JobStore):
         profiles.sort(key=lambda p: p.updated_at, reverse=True)
         return profiles
 
+    async def list_cron_profiles(self) -> list[UserProfile]:
+        """List profiles with cron_enabled=True and a resume."""
+        return [
+            p for p in self._profiles.values()
+            if p.cron_enabled and p.resume_text
+        ]
+
+    async def set_cron_enabled(self, profile_id: str, enabled: bool) -> bool:
+        """Toggle cron_enabled flag for a profile."""
+        profile = self._profiles.get(profile_id)
+        if not profile:
+            return False
+        profile.cron_enabled = enabled
+        return True
+
     async def update_job_embeddings(self, job_embeddings: list[tuple[str, list[float]]]) -> int:
         """Update embeddings for multiple jobs."""
         count = 0
@@ -210,7 +255,16 @@ class InMemoryJobStore(JobStore):
                 self._jobs[job_id].embedding = embedding
                 count += 1
         return count
-    
+
+    async def update_job_scores(self, job_scores: list[tuple[str, float]]) -> int:
+        """Update scores for multiple jobs."""
+        count = 0
+        for job_id, score in job_scores:
+            if job_id in self._jobs:
+                self._jobs[job_id].score = score
+                count += 1
+        return count
+
     async def get_jobs_without_embeddings(self, limit: int = 100) -> list[Job]:
         """Get jobs that don't have embeddings yet."""
         return [job for job in list(self._jobs.values())[:limit] if job.embedding is None]
@@ -250,6 +304,22 @@ class InMemoryJobStore(JobStore):
         if status:
             packages = [p for p in packages if p.status == status]
         return sorted(packages, key=lambda x: x.created_at, reverse=True)[:limit]
+
+    async def save_search_run(self, run: SearchRun) -> SearchRun:
+        self._search_runs[run.id] = run
+        return run
+
+    async def get_search_run(self, run_id: str) -> Optional[SearchRun]:
+        return self._search_runs.get(run_id)
+
+    async def list_search_runs(self, limit: int = 50) -> list[SearchRun]:
+        runs = list(self._search_runs.values())
+        runs.sort(key=lambda r: r.created_at, reverse=True)
+        return runs[:limit]
+
+    async def update_search_run(self, run: SearchRun) -> SearchRun:
+        self._search_runs[run.id] = run
+        return run
 
 
 class PostgresJobStore(JobStore):
@@ -299,10 +369,14 @@ class PostgresJobStore(JobStore):
         min_salary INTEGER,
         industries JSONB DEFAULT '[]',
         embedding vector(1536),
+        cron_enabled BOOLEAN DEFAULT FALSE,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     
+    -- Add cron_enabled column if it doesn't exist (for existing DBs)
+    ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS cron_enabled BOOLEAN DEFAULT FALSE;
+
     -- Indexes for common queries
     CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
     CREATE INDEX IF NOT EXISTS idx_jobs_company ON jobs(company);
@@ -316,6 +390,25 @@ class PostgresJobStore(JobStore):
     -- Vector similarity index (IVFFlat for faster approximate search)
     CREATE INDEX IF NOT EXISTS idx_jobs_embedding ON jobs 
         USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+
+    -- Automated search runs table (cron job history)
+    CREATE TABLE IF NOT EXISTS job_search_runs (
+        id VARCHAR(36) PRIMARY KEY,
+        profile_id VARCHAR(36) REFERENCES user_profiles(id) ON DELETE SET NULL,
+        profile_name VARCHAR(255),
+        search_keywords JSONB DEFAULT '[]',
+        jobs_found INTEGER DEFAULT 0,
+        top_matches JSONB DEFAULT '[]',
+        notification_channels JSONB DEFAULT '[]',
+        status VARCHAR(50) DEFAULT 'running',
+        error_message TEXT,
+        duration_ms INTEGER,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_search_runs_created ON job_search_runs(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_search_runs_profile ON job_search_runs(profile_id);
+    CREATE INDEX IF NOT EXISTS idx_search_runs_status ON job_search_runs(status);
     """
     
     def __init__(self, pool):
@@ -584,8 +677,8 @@ class PostgresJobStore(JobStore):
                     id, name, email, resume_text, summary, skills,
                     years_experience, current_title, desired_titles,
                     preferred_locations, remote_preference, min_salary,
-                    industries, embedding
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                    industries, embedding, cron_enabled
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
                 ON CONFLICT (id) DO UPDATE SET
                     name = EXCLUDED.name,
                     email = EXCLUDED.email,
@@ -600,13 +693,15 @@ class PostgresJobStore(JobStore):
                     min_salary = EXCLUDED.min_salary,
                     industries = EXCLUDED.industries,
                     embedding = EXCLUDED.embedding,
+                    cron_enabled = EXCLUDED.cron_enabled,
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 profile.id, profile.name, profile.email, profile.resume_text,
                 profile.summary, json.dumps(profile.skills), profile.years_experience,
                 profile.current_title, json.dumps(profile.desired_titles),
                 json.dumps(profile.preferred_locations), profile.remote_preference,
-                profile.min_salary, json.dumps(profile.industries), profile.embedding
+                profile.min_salary, json.dumps(profile.industries), profile.embedding,
+                profile.cron_enabled
             )
         return profile
     
@@ -637,6 +732,32 @@ class PostgresJobStore(JobStore):
                 "SELECT * FROM user_profiles ORDER BY updated_at DESC LIMIT 50"
             )
         return [self._row_to_profile(row) for row in rows]
+
+    async def list_cron_profiles(self) -> list[UserProfile]:
+        """List profiles with cron_enabled=True and a resume."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM user_profiles
+                WHERE cron_enabled = TRUE
+                  AND resume_text IS NOT NULL AND resume_text != ''
+                ORDER BY updated_at DESC
+                """,
+            )
+        return [self._row_to_profile(row) for row in rows]
+
+    async def set_cron_enabled(self, profile_id: str, enabled: bool) -> bool:
+        """Toggle cron_enabled flag for a profile."""
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE user_profiles
+                SET cron_enabled = $1, updated_at = CURRENT_TIMESTAMP
+                WHERE id = $2
+                """,
+                enabled, profile_id,
+            )
+        return result == "UPDATE 1"
 
     # Feedback methods
     async def save_feedback(self, feedback: JobFeedback) -> JobFeedback:
@@ -796,6 +917,7 @@ class PostgresJobStore(JobStore):
             min_salary=row['min_salary'],
             industries=parse_json_list(row['industries']),
             embedding=list(row['embedding']) if row['embedding'] is not None else None,
+            cron_enabled=row.get('cron_enabled', False) or False,
             created_at=row['created_at'],
             updated_at=row['updated_at'],
         )
@@ -858,7 +980,22 @@ class PostgresJobStore(JobStore):
                 job_embeddings
             )
         return len(job_embeddings)
-    
+
+    async def update_job_scores(self, job_scores: list[tuple[str, float]]) -> int:
+        """Update scores for multiple jobs."""
+        if not job_scores:
+            return 0
+
+        async with self._pool.acquire() as conn:
+            await conn.executemany(
+                """
+                UPDATE jobs SET score = $2, updated_at = CURRENT_TIMESTAMP
+                WHERE id = $1
+                """,
+                job_scores
+            )
+        return len(job_scores)
+
     async def get_jobs_without_embeddings(self, limit: int = 100) -> list[Job]:
         """Get jobs that don't have embeddings yet."""
         async with self._pool.acquire() as conn:
@@ -867,6 +1004,79 @@ class PostgresJobStore(JobStore):
                 limit
             )
         return [self._row_to_job(row) for row in rows]
+
+    # ------------------------------------------------------------------
+    # Search run methods (cron job history)
+    # ------------------------------------------------------------------
+
+    async def save_search_run(self, run: SearchRun) -> SearchRun:
+        """Save an automated search run record."""
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO job_search_runs (
+                    id, profile_id, profile_name, search_keywords,
+                    jobs_found, top_matches, notification_channels,
+                    status, error_message, duration_ms, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                ON CONFLICT (id) DO UPDATE SET
+                    jobs_found = EXCLUDED.jobs_found,
+                    top_matches = EXCLUDED.top_matches,
+                    notification_channels = EXCLUDED.notification_channels,
+                    status = EXCLUDED.status,
+                    error_message = EXCLUDED.error_message,
+                    duration_ms = EXCLUDED.duration_ms
+                """,
+                run.id, run.profile_id, run.profile_name,
+                json.dumps(run.search_keywords), run.jobs_found,
+                json.dumps(run.top_matches), json.dumps(run.notification_channels),
+                run.status.value, run.error_message, run.duration_ms, run.created_at,
+            )
+        return run
+
+    async def get_search_run(self, run_id: str) -> Optional[SearchRun]:
+        """Get a search run by ID."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM job_search_runs WHERE id = $1", run_id
+            )
+        if row:
+            return self._row_to_search_run(row)
+        return None
+
+    async def list_search_runs(self, limit: int = 50) -> list[SearchRun]:
+        """List search runs, most recent first."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM job_search_runs ORDER BY created_at DESC LIMIT $1",
+                limit,
+            )
+        return [self._row_to_search_run(row) for row in rows]
+
+    async def update_search_run(self, run: SearchRun) -> SearchRun:
+        """Update an existing search run."""
+        return await self.save_search_run(run)  # upsert handles it
+
+    def _row_to_search_run(self, row) -> SearchRun:
+        """Convert a database row to a SearchRun object."""
+        def _parse_json(val):
+            if isinstance(val, (list, dict)):
+                return val
+            return json.loads(val or "[]")
+
+        return SearchRun(
+            id=row["id"],
+            profile_id=row["profile_id"] or "",
+            profile_name=row["profile_name"] or "",
+            search_keywords=_parse_json(row["search_keywords"]),
+            jobs_found=row["jobs_found"] or 0,
+            top_matches=_parse_json(row["top_matches"]),
+            notification_channels=_parse_json(row["notification_channels"]),
+            status=SearchRunStatus(row["status"]),
+            error_message=row["error_message"],
+            created_at=row["created_at"],
+            duration_ms=row["duration_ms"],
+        )
 
 
 async def get_store(config: Optional["DatabaseConfig"] = None) -> JobStore:

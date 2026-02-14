@@ -2,7 +2,7 @@
 
 Architecture:
   CoordinatorExecutor (Router)
-    ├── job_search_agent   (ChatAgent with 11 tools)
+    ├── job_search_agent   (ChatAgent with 12 tools)
     └── application_prep_agent  (ChatAgent with 3 tools)
 
 The Coordinator classifies each user request and delegates to the appropriate
@@ -91,12 +91,26 @@ CRITICAL — ALWAYS CHECK PROFILE FIRST:
 - If the user says "search for jobs based on my preferences", you have \
   everything you need in the profile — run the searches immediately.
 
+SMART SEARCH STRATEGY:
+- When searching based on a user's profile/preferences, call \
+  suggest_search_titles() FIRST to get optimized search keywords tailored \
+  to their experience level, skills, desired roles, and resume.
+- Use the suggested keywords across MULTIPLE search_jobs calls for broader \
+  coverage (e.g., one search per keyword category).
+- Don't limit yourself to only the user's desired_titles — the suggested \
+  keywords include career-growth roles and skill-based variations that the \
+  user might not have thought of.
+- Combine the keyword suggestions with the user's location and salary \
+  preferences from their profile.
+
 SEARCH TIPS:
 - For remote jobs: Use remote_only=True, NOT location="Remote"
 - For broader results: Try multiple search terms
 - For senior roles: Search "director", "VP", "head of", "principal", "staff"
 - Many high-paying jobs don't list salary - suggest removing min_salary filter
 - If a search returns few results, automatically try broader terms
+- Results are auto-sorted by a composite score: 40% recency + 60% profile match
+- Default max_results is 30 — use this for broad coverage
 
 DATE FILTERING:
 - "yesterday"/"today" = last 24 hours
@@ -111,13 +125,17 @@ RESUME HANDLING:
 
 WORKFLOW:
 1. Call get_profile() first to load existing preferences and resume
-2. Search for jobs using profile preferences (desired_titles, locations, etc.)
-3. Use rank_saved_jobs to show best matches
-4. Help track applications with mark_job_applied / mark_job_rejected
-5. Use send_job_notifications to deliver top matches
-6. Use provide_feedback to capture user feedback
+2. Call suggest_search_titles() to get smart keyword suggestions based on \
+   the full profile (experience, skills, resume, desired roles)
+3. Search for jobs using the suggested keywords combined with profile \
+   preferences (locations, salary, remote preference)
+4. Use rank_saved_jobs to show best matches
+5. Help track applications with mark_job_applied / mark_job_rejected
+6. Use send_job_notifications to deliver top matches
+7. Use provide_feedback to capture user feedback
 
-When presenting jobs, format them clearly with title, company, location, salary.
+When presenting jobs, format them clearly with title, company, location, salary, 
+and the job posting link (URL). Always include the link so the user can apply.
 Be proactive - suggest alternative searches if results are limited.
 """
 
@@ -159,11 +177,15 @@ class JobSearchTools:
         provider: JobIngestionProvider,
         ranking_service: RankingService,
         notification_service: NotificationService,
+        openai_client: Optional[AsyncAzureOpenAI] = None,
+        deployment_name: str = "",
     ):
         self.store = store
         self.provider = provider
         self.ranking_service = ranking_service
         self.notification_service = notification_service
+        self._openai_client = openai_client
+        self._deployment = deployment_name
 
     async def search_jobs(
         self,
@@ -171,7 +193,7 @@ class JobSearchTools:
         location: Optional[str] = None,
         remote_only: bool = False,
         min_salary: Optional[int] = None,
-        max_results: int = 10,
+        max_results: int = 30,
         date_posted: Optional[str] = None,
     ) -> str:
         """Search for new job listings matching the criteria.
@@ -184,7 +206,7 @@ class JobSearchTools:
             remote_only: Set to True for remote/work-from-home positions.
             min_salary: Minimum yearly salary requirement (e.g., 150000 for $150K).
                         Many postings don't include salary, so high minimums may filter out jobs.
-            max_results: Maximum number of results to return (default 10, max 100).
+            max_results: Maximum number of results to return (default 30, max 100).
             date_posted: Filter by posting date. Options: "yesterday", "3days", "week", "month".
 
         Returns:
@@ -230,6 +252,14 @@ class JobSearchTools:
             if job_embeddings:
                 await self.store.update_job_embeddings(job_embeddings)
 
+        # --- Composite sorting: recency (40%) + profile match (60%) ---
+        if jobs:
+            jobs = self._sort_jobs_composite(jobs)
+            # Persist scores to DB so cron/API can access them
+            score_updates = [(j.id, j.score) for j in jobs if j.score is not None]
+            if score_updates:
+                await self.store.update_job_scores(score_updates)
+
         if not jobs:
             search_info = f"query='{query}'"
             if location:
@@ -262,10 +292,71 @@ class JobSearchTools:
             salary = ""
             if job.salary_min and job.salary_max:
                 salary = f" | ${job.salary_min:,}-${job.salary_max:,}"
+            score_str = f" | Match: {round(job.score * 100, 1)}%" if job.score else ""
+            link = f" | 🔗 {job.url}" if job.url else ""
             lines.append(
-                f"{i}. {job.title} at {job.company} ({job.location}){salary} [ID: {job.id[:8]}]"
+                f"{i}. {job.title} at {job.company} ({job.location}){salary}{score_str}{link} [ID: {job.id[:8]}]"
             )
         return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Composite sorting: recency (40%) + profile match (60%)
+    # ------------------------------------------------------------------
+
+    def _sort_jobs_composite(self, jobs: list) -> list:
+        """Sort jobs by a composite score combining recency and profile match.
+
+        - Recency (40%): How recently the job was posted. Jobs posted today get
+          1.0; jobs 30+ days old get 0.0.  Jobs without a posted_at date get 0.3
+          (neutral — don't penalise, don't reward).
+        - Profile match (60%): Cosine similarity between the job's embedding and
+          the current user profile's embedding.  Jobs without an embedding get
+          0.0 and sort to the bottom.
+
+        The composite score is stored on each job's ``score`` field so it's
+        visible in formatted output.
+        """
+        from datetime import datetime, timezone
+
+        from .tools import get_current_profile
+
+        profile = get_current_profile()
+        profile_embedding = profile.embedding if profile else None
+        now = datetime.utcnow()
+
+        RECENCY_WEIGHT = 0.40
+        MATCH_WEIGHT = 0.60
+
+        for job in jobs:
+            # --- Recency score ---
+            if job.posted_at:
+                age_days = max((now - job.posted_at).total_seconds() / 86400, 0)
+                # Linear decay over 30 days, clamped to [0, 1]
+                recency = max(1.0 - age_days / 30.0, 0.0)
+            else:
+                recency = 0.3  # neutral
+
+            # --- Profile match score (cosine similarity) ---
+            match_score = 0.0
+            if profile_embedding and job.embedding:
+                match_score = self._cosine_similarity(profile_embedding, job.embedding)
+
+            # --- Composite ---
+            job.score = round(RECENCY_WEIGHT * recency + MATCH_WEIGHT * match_score, 4)
+
+        # Sort descending by composite score
+        jobs.sort(key=lambda j: j.score or 0.0, reverse=True)
+        return jobs
+
+    @staticmethod
+    def _cosine_similarity(a: list[float], b: list[float]) -> float:
+        """Compute cosine similarity between two vectors."""
+        dot = sum(x * y for x, y in zip(a, b))
+        norm_a = math.sqrt(sum(x * x for x in a))
+        norm_b = math.sqrt(sum(x * x for x in b))
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        return dot / (norm_a * norm_b)
 
     async def list_saved_jobs(self, limit: int = 20) -> str:
         """List all saved job listings.
@@ -282,8 +373,9 @@ class JobSearchTools:
 
         lines = [f"Saved jobs ({len(jobs)}):"]
         for i, job in enumerate(jobs, 1):
+            link = f" | 🔗 {job.url}" if job.url else ""
             lines.append(
-                f"{i}. [{job.status.value}] {job.title} at {job.company} [ID: {job.id[:8]}]"
+                f"{i}. [{job.status.value}] {job.title} at {job.company}{link} [ID: {job.id[:8]}]"
             )
         return "\n".join(lines)
 
@@ -483,12 +575,19 @@ Description:
         if not ranked_jobs:
             return "Could not rank jobs. Please try again."
 
+        # Persist ranking scores to DB so cron / API can access them
+        score_updates = [(rj.job.id, rj.score) for rj in ranked_jobs if rj.score is not None]
+        if score_updates:
+            await self.store.update_job_scores(score_updates)
+
         lines = [f"Top {len(ranked_jobs)} job matches for {profile.name}:"]
         for i, rj in enumerate(ranked_jobs, 1):
             job = rj.job
             score_pct = round(rj.score * 100, 1)
             lines.append(f"\n{i}. {job.title} at {job.company} - Score: {score_pct}%")
             lines.append(f"   {rj.justification}")
+            if job.url:
+                lines.append(f"   🔗 {job.url}")
             lines.append(f"   [ID: {job.id[:8]}]")
 
         return "\n".join(lines)
@@ -614,6 +713,203 @@ Description:
             FeedbackType.COMPANY_BLACKLIST: f"Added {job.company} to your blacklist. Future searches will deprioritize this company.",
         }
         return messages.get(feedback_type, f"Feedback recorded for '{job.title}'.")
+
+    async def suggest_search_titles(self) -> str:
+        """Analyze the user's profile and suggest optimized job search title keywords.
+
+        Combines years of experience, technical skills, desired roles, current title,
+        and resume content to generate smart search keywords tailored to the user's
+        background. Call this before running searches to get the best keywords.
+
+        Returns:
+            A categorized list of suggested search title keywords with explanations.
+        """
+        profile = get_current_profile()
+        if not profile:
+            return (
+                "No user profile set. Please upload a resume or create a profile "
+                "first so I can suggest relevant search titles."
+            )
+
+        # Build a profile summary for the LLM
+        profile_parts = []
+        if profile.current_title:
+            profile_parts.append(f"Current Title: {profile.current_title}")
+        if profile.years_experience is not None:
+            profile_parts.append(f"Years of Experience: {profile.years_experience}")
+        if profile.skills:
+            profile_parts.append(f"Technical Skills: {', '.join(profile.skills)}")
+        if profile.desired_titles:
+            profile_parts.append(f"Desired Roles: {', '.join(profile.desired_titles)}")
+        if profile.industries:
+            profile_parts.append(f"Industries: {', '.join(profile.industries)}")
+        if profile.preferred_locations:
+            profile_parts.append(f"Preferred Locations: {', '.join(profile.preferred_locations)}")
+        if profile.remote_preference and profile.remote_preference != "flexible":
+            profile_parts.append(f"Remote Preference: {profile.remote_preference}")
+        if profile.min_salary:
+            profile_parts.append(f"Minimum Salary: ${profile.min_salary:,}")
+
+        # Include resume excerpt for deeper context (truncate to avoid token bloat)
+        resume_excerpt = ""
+        if profile.resume_text:
+            resume_excerpt = profile.resume_text[:3000]
+            profile_parts.append(f"\nResume Content (excerpt):\n{resume_excerpt}")
+
+        profile_summary = "\n".join(profile_parts)
+
+        prompt = f"""\
+Analyze this job seeker's profile and suggest optimized search title keywords \
+they should use when searching for jobs. Consider ALL of the following:
+
+1. **Experience level** — Map years of experience to seniority prefixes \
+   (e.g., 0-2yr→Junior/Associate, 3-5yr→Mid-level, 5-8yr→Senior, \
+   8-12yr→Staff/Lead, 12+yr→Principal/Director/VP)
+2. **Technical skills** — Generate role titles tied to their strongest \
+   technologies (e.g., Python + ML → "Machine Learning Engineer")
+3. **Desired roles** — Include these directly, plus common variations and \
+   synonyms used in job postings
+4. **Resume content** — Infer specializations from project descriptions, \
+   past titles, and accomplishments
+5. **Career progression** — Suggest both lateral moves and logical next-step \
+   roles
+
+PROFILE:
+{profile_summary}
+
+Return the suggestions in this exact format:
+
+BASED ON DESIRED ROLES:
+- [keyword 1]
+- [keyword 2]
+...
+
+BASED ON EXPERIENCE LEVEL ({profile.years_experience or 'unknown'} years):
+- [keyword 1]
+- [keyword 2]
+...
+
+BASED ON TECHNICAL SKILLS:
+- [keyword 1]
+- [keyword 2]
+...
+
+INFERRED FROM RESUME:
+- [keyword 1]
+- [keyword 2]
+...
+
+CAREER GROWTH OPPORTUNITIES:
+- [keyword 1]
+- [keyword 2]
+...
+
+For each category, suggest 3-6 specific job title keywords optimized for \
+job search engines (concise, like actual job posting titles). After the \
+lists, add a brief RECOMMENDED SEARCH STRATEGY section with 2-3 tips \
+specific to this person's profile."""
+
+        # Use the direct OpenAI client if available, otherwise return a
+        # rule-based fallback
+        if self._openai_client and self._deployment:
+            try:
+                resp = await self._openai_client.chat.completions.create(
+                    model=self._deployment,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are a career advisor and job search strategist. "
+                                "Generate specific, actionable job title keywords "
+                                "optimized for job search engines."
+                            ),
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    max_completion_tokens=1000,
+                    temperature=0.7,
+                )
+                return resp.choices[0].message.content or "No suggestions generated."
+            except Exception as e:
+                logger.warning("LLM suggest_search_titles failed: %s", e)
+                # Fall through to rule-based fallback
+
+        # Rule-based fallback when no OpenAI client is available
+        return self._suggest_titles_fallback(profile)
+
+    @staticmethod
+    def _suggest_titles_fallback(profile: UserProfile) -> str:
+        """Generate rule-based search title suggestions without an LLM."""
+        lines = ["Suggested search title keywords based on your profile:\n"]
+
+        # Desired roles (direct)
+        if profile.desired_titles:
+            lines.append("BASED ON DESIRED ROLES:")
+            for t in profile.desired_titles:
+                lines.append(f"- {t}")
+            lines.append("")
+
+        # Experience-level titles
+        yoe = profile.years_experience or 0
+        if yoe <= 2:
+            prefixes = ["Junior", "Associate", "Entry-Level"]
+        elif yoe <= 5:
+            prefixes = ["Mid-Level", ""]
+        elif yoe <= 8:
+            prefixes = ["Senior"]
+        elif yoe <= 12:
+            prefixes = ["Staff", "Lead", "Senior"]
+        else:
+            prefixes = ["Principal", "Staff", "Director", "Head of", "VP"]
+
+        base_title = profile.current_title or (
+            profile.desired_titles[0] if profile.desired_titles else "Engineer"
+        )
+        lines.append(f"BASED ON EXPERIENCE LEVEL ({yoe} years):")
+        seen = set()
+        for p in prefixes:
+            suggestion = f"{p} {base_title}".strip()
+            if suggestion not in seen:
+                lines.append(f"- {suggestion}")
+                seen.add(suggestion)
+        lines.append("")
+
+        # Skill-based titles
+        skill_title_map = {
+            "python": ["Python Developer", "Python Engineer"],
+            "javascript": ["JavaScript Developer", "Frontend Engineer"],
+            "typescript": ["TypeScript Developer", "Frontend Engineer"],
+            "react": ["React Developer", "Frontend Engineer"],
+            "java": ["Java Developer", "Java Engineer"],
+            "c#": [".NET Developer", "C# Engineer"],
+            ".net": [".NET Developer", ".NET Engineer"],
+            "aws": ["Cloud Engineer", "AWS Engineer"],
+            "azure": ["Cloud Engineer", "Azure Engineer"],
+            "kubernetes": ["DevOps Engineer", "Platform Engineer"],
+            "docker": ["DevOps Engineer", "Platform Engineer"],
+            "machine learning": ["ML Engineer", "Machine Learning Engineer"],
+            "data science": ["Data Scientist", "Data Analyst"],
+            "sql": ["Data Engineer", "Database Developer"],
+            "ai": ["AI Engineer", "ML Engineer"],
+        }
+
+        skill_suggestions = set()
+        for skill in profile.skills:
+            for key, titles in skill_title_map.items():
+                if key in skill.lower():
+                    skill_suggestions.update(titles)
+
+        if skill_suggestions:
+            lines.append("BASED ON TECHNICAL SKILLS:")
+            for s in sorted(skill_suggestions)[:8]:
+                lines.append(f"- {s}")
+            lines.append("")
+
+        lines.append(
+            "TIP: Use these keywords with search_jobs for more targeted results. "
+            "Try multiple searches with different keywords for broader coverage."
+        )
+        return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -776,7 +1072,7 @@ class CoordinatorExecutor(Executor):
 
     Architecture:
         classifier  →  intent
-          ├── JOB_SEARCH   →  job_search_agent   (11 tools)
+          ├── JOB_SEARCH   →  job_search_agent   (12 tools)
           └── APP_PREP     →  application_prep_agent (3 tools)
 
     The classifier is a lightweight LLM call that outputs "JOB_SEARCH" or
@@ -801,7 +1097,10 @@ class CoordinatorExecutor(Executor):
         self._deployment = deployment_name
 
         # --- Tool objects ---
-        job_tools = JobSearchTools(store, provider, ranking_service, notification_service)
+        job_tools = JobSearchTools(
+            store, provider, ranking_service, notification_service,
+            openai_client=openai_client, deployment_name=deployment_name,
+        )
         app_tools = AppPrepTools(store, application_prep_service) if application_prep_service else None
 
         # --- Classifier (no tools, cheap routing call) ---
@@ -826,6 +1125,7 @@ class CoordinatorExecutor(Executor):
                 job_tools.get_profile,
                 job_tools.send_job_notifications,
                 job_tools.provide_feedback,
+                job_tools.suggest_search_titles,
             ],
         )
 
@@ -951,7 +1251,7 @@ class CoordinatorExecutor(Executor):
                 response = await self.app_prep_agent.run(messages)
             else:
                 agent_name = "job_search_agent"
-                logger.info("[TRACE] Routing to Job Search Agent (11 tools)")
+                logger.info("[TRACE] Routing to Job Search Agent (12 tools)")
                 response = await self.job_search_agent.run(messages)
 
             agent_span.set_attribute("agent.name", agent_name)

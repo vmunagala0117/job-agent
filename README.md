@@ -38,11 +38,12 @@ python -m job_agent.webapp
 │             ▼                      ▼                     │
 │  ┌──────────────────┐   ┌────────────────────┐          │
 │  │ Job Search Agent  │   │ App Prep Agent     │          │
-│  │ (11 tools)        │   │ (3 tools)          │          │
+│  │ (12 tools)        │   │ (3 tools)          │          │
 │  │ • search_jobs     │   │ • analyze_job_fit  │          │
 │  │ • get_profile     │   │ • prepare_app      │          │
-│  │ • rank_saved      │   │ • get_package      │          │
-│  │ • list_saved      │   └────────────────────┘          │
+│  │ • suggest_titles  │   │ • get_package      │          │
+│  │ • rank_saved      │   └────────────────────┘          │
+│  │ • list_saved      │                                   │
 │  │ • get_details     │                                   │
 │  │ • set_profile     │                                   │
 │  │ • upload_resume   │                                   │
@@ -208,6 +209,8 @@ Open [http://localhost:8000](http://localhost:8000) for the web UI.
 | `GET` | `/api/feedback/analytics` | Feedback aggregate analytics |
 | `GET` | `/api/traces` | Get trace log for session |
 | `POST` | `/api/chat/reset` | Reset conversation |
+| `POST` | `/api/cron/daily-search` | Trigger automated job search (secured with `X-Cron-Key`) |
+| `GET` | `/api/cron/runs` | List cron search run history |
 
 ## Usage Examples
 
@@ -245,6 +248,32 @@ The agent understands natural language:
 5. **Location Match** (15%) — Preferred locations overlap
 6. **Salary Match** (10%) — Min salary comparison
 7. **Composite Score** — Weighted 0–100%
+
+Search results are additionally sorted by a composite score: **40% recency** (how recently the job was posted) + **60% profile match** (cosine similarity between profile and job embeddings). The default search limit is 30 results.
+
+## Daily Automated Search (Cron)
+
+The system supports automated daily job searches via an Azure Functions Timer Trigger:
+
+1. **Set environment variables:**
+   ```bash
+   CRON_ENABLED=true
+   CRON_API_KEY=your-secret-key
+   ```
+
+2. **Test locally:**
+   ```bash
+   curl -X POST http://localhost:8080/api/cron/daily-search \
+     -H "X-Cron-Key: your-secret-key"
+   ```
+
+3. **Deploy Azure Function:**
+   ```bash
+   cd azure-functions/daily-search
+   func azure functionapp publish <your-function-app>
+   ```
+
+The cron endpoint iterates over all saved profiles, sends a synthetic message through the same agent pipeline used by the chat UI, persists results in the `job_search_runs` table, and returns a summary. View run history at `GET /api/cron/runs`.
 
 ## Evaluation
 
@@ -298,10 +327,16 @@ See [docs/kql-queries.kql](docs/kql-queries.kql) for 14 ready-to-run KQL queries
 | `DATABASE_URL` | PostgreSQL connection URL | No |
 | `APPLICATIONINSIGHTS_CONNECTION_STRING` | Azure Monitor connection string | No |
 | `PROXYCURL_API_KEY` | Proxycurl API for recruiter search | No |
+| `CRON_ENABLED` | Enable cron endpoint (`true`/`false`) | No |
+| `CRON_API_KEY` | Shared secret for `X-Cron-Key` header | No |
+| `CRON_SCHEDULE` | Cron schedule (default: `0 6 * * *` = 6 AM daily) | No |
+| `CRON_APP_URL` | Base URL of webapp for Azure Function to call | No |
 
 ## Documentation
 
 - **[docs/TECHNICAL.md](docs/TECHNICAL.md)** — Internal code flow, request lifecycle, module reference, design decisions
+- **[docs/observability-guide.md](docs/observability-guide.md)** — Beginner-friendly OpenTelemetry guide: how traces, metrics, and logs flow to Application Insights
+- **[docs/evaluation-guide.md](docs/evaluation-guide.md)** — Evaluation framework guide: layers, evaluators, datasets, and recommended next steps
 - **[docs/kql-queries.kql](docs/kql-queries.kql)** — Application Insights KQL queries for monitoring
 - **[evals/](evals/)** — Evaluation harness: golden datasets, LLM-as-judge, classifier accuracy
 
@@ -321,6 +356,8 @@ See [docs/kql-queries.kql](docs/kql-queries.kql) for 14 ready-to-run KQL queries
 - [x] Structured audit logging (tool-level OTel spans)
 - [x] Evaluation framework (Azure AI Evaluation SDK + custom evaluators)
 - [x] Feedback analytics (satisfaction rate, timelines, negative feedback)
+- [x] Smart search keyword suggestions (LLM-powered `suggest_search_titles`)
+- [x] Composite search sorting (40% recency + 60% profile match)
+- [x] Scheduled job search (daily cron via Azure Functions Timer Trigger)
 - [ ] Recruiter search integration
-- [ ] Scheduled job ingestion (cron-based auto-search)
 - [ ] CI regression suite (golden dataset in pipeline)

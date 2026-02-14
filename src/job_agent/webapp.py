@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -438,6 +438,8 @@ async def list_profiles():
                 "skills_count": len(p.skills),
                 "updated_at": p.updated_at.isoformat() if p.updated_at else "",
                 "is_active": p.id == current_id,
+                "cron_enabled": p.cron_enabled,
+                "has_resume": bool(p.resume_text),
             }
             for p in profiles
         ]
@@ -469,6 +471,50 @@ async def select_profile(profile_id: str):
     }
 
 
+@app.patch("/api/profiles/{profile_id}/cron")
+async def toggle_profile_cron(profile_id: str, enabled: bool = True):
+    """Enable or disable the daily cron job for a specific profile.
+
+    Only profiles with a resume and cron_enabled=True will be processed
+    by the automated daily search pipeline.
+
+    Query params:
+      enabled — True to opt-in, False to opt-out (default: True)
+    """
+    store = _services.get("store")
+    if not store:
+        raise HTTPException(status_code=503, detail="Store not available")
+
+    profile = await store.get_profile(profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+
+    if enabled and not profile.resume_text:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot enable cron for a profile without a resume. "
+                   "Upload a resume first.",
+        )
+
+    try:
+        success = await store.set_cron_enabled(profile_id, enabled)
+    except Exception as exc:
+        logger.exception("set_cron_enabled failed for profile %s: %s", profile_id, exc)
+        raise HTTPException(status_code=500, detail=f"Failed to update profile: {exc}")
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to update profile")
+
+    action = "enabled" if enabled else "disabled"
+    logger.info("Cron %s for profile %s (%s)", action, profile.name, profile_id)
+
+    return {
+        "status": "ok",
+        "profile_id": profile_id,
+        "profile_name": profile.name,
+        "cron_enabled": enabled,
+    }
+
+
 @app.get("/api/profiles/{profile_id}")
 async def get_profile_detail(profile_id: str):
     """Return full profile details for the edit form."""
@@ -492,6 +538,7 @@ async def get_profile_detail(profile_id: str):
         "min_salary": profile.min_salary,
         "industries": profile.industries,
         "has_resume": bool(profile.resume_text),
+        "cron_enabled": profile.cron_enabled,
     }
 
 
@@ -732,6 +779,207 @@ async def reset_session(req: ChatRequest):
         _trace_handler.clear_session(session_id)
     new_session = _get_or_create_session(None)
     return SessionInfo(session_id=new_session.id, message_count=0)
+
+
+# ---------------------------------------------------------------------------
+# Cron / automated daily search
+# ---------------------------------------------------------------------------
+
+def _verify_cron_key(request) -> None:
+    """Validate the X-Cron-Key header against the configured secret."""
+    from .config import AppConfig
+
+    config = AppConfig.load()
+    expected = config.cron.api_key if config.cron else os.getenv("CRON_API_KEY", "")
+    provided = request.headers.get("X-Cron-Key", "")
+    if not expected or provided != expected:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Cron-Key")
+
+
+@app.post("/api/cron/daily-search")
+async def cron_daily_search(request: Request, profile_id: str | None = None):
+    """Run an automated daily job search for all profiles.
+
+    Secured with an ``X-Cron-Key`` header.  The endpoint:
+      1. Loads saved profiles
+      2. For each profile, sends a synthetic message through the existing agent
+      3. Persists a SearchRun record with results
+      4. Returns a summary
+
+    Called by Azure Functions Timer Trigger (or any scheduler).
+
+    Query params:
+      profile_id — (optional) run for a single profile only (useful for testing)
+    """
+
+    _verify_cron_key(request)
+
+    if _agent is None:
+        raise HTTPException(status_code=503, detail="Agent not ready")
+
+    store = _services.get("store")
+    if not store:
+        raise HTTPException(status_code=503, detail="Store not available")
+
+    from .models import SearchRun, SearchRunStatus
+    from .tools import get_current_profile, set_current_profile
+
+    # Load only cron-enabled profiles (with resume)
+    if profile_id:
+        # Single profile override for testing — still requires cron_enabled or explicit ID
+        profile = await store.get_profile(profile_id)
+        if not profile:
+            raise HTTPException(status_code=404, detail=f"Profile {profile_id} not found")
+        if not profile.resume_text:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Profile '{profile.name}' has no resume. Upload one first.",
+            )
+        profiles = [profile]
+    else:
+        profiles = await store.list_cron_profiles()
+        if not profiles:
+            return {"status": "skipped", "reason": "No cron-enabled profiles found"}
+
+    results = []
+    for profile in profiles:
+        run = SearchRun(profile_id=profile.id, profile_name=profile.name)
+        await store.save_search_run(run)
+
+        t0 = time.time()
+        try:
+            # Activate profile for the agent
+            set_current_profile(profile)
+
+            # Build a synthetic prompt that triggers the full search pipeline
+            synthetic_msg = (
+                "Run a daily automated job search based on my profile preferences. "
+                "Use suggest_search_titles to get optimised keywords, then search_jobs "
+                "for each keyword with max_results=30. Rank the results and send "
+                "notifications for the top matches."
+            )
+
+            session = _get_or_create_session(None)
+            session.messages.append(
+                ChatMessage(role=Role.USER, contents=[TextContent(text=synthetic_msg)])
+            )
+
+            response = await _agent.run(session.messages)
+            raw_text = response.text or ""
+
+            # Parse METADATA suffix to extract usage info
+            import re as _re
+
+            _META_RE = _re.compile(r"\n<!--METADATA:(\{.*?\})-->$", _re.DOTALL)
+            match = _META_RE.search(raw_text)
+            if match:
+                raw_text = raw_text[: match.start()]
+
+            # Gather recently fetched jobs for this profile
+            recent_jobs = await store.list_all(limit=30)
+            top = [
+                {
+                    "id": j.id[:8],
+                    "title": j.title,
+                    "company": j.company,
+                    "score": j.score,
+                    "url": j.url,
+                }
+                for j in recent_jobs[:10]
+                if j.score is not None
+            ]
+
+            # ── Phase 2: Generate application materials for top matches ──
+            package_ids: list[str] = []
+            prep_candidates = [j for j in recent_jobs[:10]
+                               if j.score is not None and j.score > 0.3]
+            if prep_candidates:
+                top5_ids = [j.id[:8] for j in prep_candidates[:5]]
+                prep_msg = (
+                    "For each of the following top job matches, prepare application "
+                    "materials (cover letter, resume suggestions, and intro email). "
+                    "Job IDs: " + ", ".join(top5_ids)
+                )
+                session.messages.append(
+                    ChatMessage(role=Role.USER, contents=[TextContent(text=prep_msg)])
+                )
+                prep_response = await _agent.run(session.messages)
+                logger.info("Cron Phase 2 (app prep) completed for %s", profile.name)
+
+                # Collect packages created in this window
+                from datetime import datetime, timedelta, timezone
+                cutoff = datetime.now(timezone.utc) - timedelta(minutes=10)
+                all_pkgs = await store.list_application_packages(limit=20)
+                for pkg in all_pkgs:
+                    pkg_ts = pkg.created_at
+                    if pkg_ts.tzinfo is None:
+                        pkg_ts = pkg_ts.replace(tzinfo=timezone.utc)
+                    if pkg_ts >= cutoff:
+                        package_ids.append(pkg.id)
+
+            elapsed_ms = int((time.time() - t0) * 1000)
+            run.status = SearchRunStatus.COMPLETED
+            run.jobs_found = len(recent_jobs)
+            run.top_matches = top
+            run.duration_ms = elapsed_ms
+            # Store generated package IDs in notification_channels field
+            if package_ids:
+                run.notification_channels = package_ids
+            await store.update_search_run(run)
+
+            results.append({
+                "profile": profile.name,
+                "status": "completed",
+                "jobs_found": run.jobs_found,
+                "top_matches": len(top),
+                "packages_generated": len(package_ids),
+                "duration_ms": elapsed_ms,
+            })
+
+            # Clean up the throwaway session
+            if session.id in _sessions:
+                del _sessions[session.id]
+
+        except Exception as exc:
+            elapsed_ms = int((time.time() - t0) * 1000)
+            run.status = SearchRunStatus.FAILED
+            run.error_message = str(exc)[:500]
+            run.duration_ms = elapsed_ms
+            await store.update_search_run(run)
+            logger.exception("Cron search failed for profile %s", profile.name)
+            results.append({
+                "profile": profile.name,
+                "status": "failed",
+                "error": str(exc)[:200],
+            })
+
+    return {"status": "ok", "profiles_processed": len(results), "results": results}
+
+
+@app.get("/api/cron/runs")
+async def list_cron_runs(limit: int = 20):
+    """List recent automated search runs."""
+    store = _services.get("store")
+    if not store:
+        return []
+
+    from .models import SearchRun  # noqa: F811
+
+    runs = await store.list_search_runs(limit=limit)
+    return [
+        {
+            "id": r.id,
+            "profile_name": r.profile_name,
+            "search_keywords": r.search_keywords,
+            "jobs_found": r.jobs_found,
+            "top_matches": r.top_matches,
+            "status": r.status.value,
+            "error_message": r.error_message,
+            "duration_ms": r.duration_ms,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in runs
+    ]
 
 
 # ---------------------------------------------------------------------------
