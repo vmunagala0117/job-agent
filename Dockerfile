@@ -31,6 +31,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 FROM deps AS app
 
 COPY pyproject.toml .
+COPY README.md .
 COPY src/ src/
 
 # Install the project itself (editable not needed in production)
