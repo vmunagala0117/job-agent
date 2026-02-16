@@ -1,5 +1,15 @@
 # Job Agent
 
+Lightweight job-search assistant application used for demo deployments.
+
+This repository contains:
+- `src/` - FastAPI webapp and job-agent logic
+- `azure-functions/` - Azure Function that triggers daily cron calls
+- `scripts/deploy.ps1` - Deployment helper that creates ACR, builds image, deploys Web App and Function
+
+To build and deploy, use the `scripts/deploy.ps1` helper or run `az acr build` manually.
+# Job Agent
+
 A production-grade AI job search assistant built with **Microsoft Agent Framework** and **Azure OpenAI**. A multi-agent system that searches for jobs, ranks them against your profile, and generates tailored application materials — all through natural language conversation.
 
 ## Quick Start
