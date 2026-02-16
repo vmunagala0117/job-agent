@@ -32,5 +32,3 @@ htmlcov/
 # Docker
 .git
 .gitignore
-*.md
-!README.md
