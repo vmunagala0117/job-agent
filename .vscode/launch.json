@@ -22,13 +22,19 @@
             "request": "launch",
             "module": "job_agent.webapp",
             "console": "integratedTerminal",
-            "justMyCode": false
+            "justMyCode": false,
+             "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            }
         },
         {
             "name": "API Server (port 8088)",
             "type": "debugpy",
             "request": "launch",
-            "module": "job_agent.server"
+            "module": "job_agent.server",
+             "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            }
         },
         {
             "name": "Debug: Cron Job Test",

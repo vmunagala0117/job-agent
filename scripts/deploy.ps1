@@ -260,12 +260,28 @@ if (-not $SkipWebApp) {
 
     if ($webappExists) {
         Write-Ok "Web App '$WebAppName' already exists - updating container image"
-        az webapp config container set `
-            --name $WebAppName `
-            --resource-group $ResourceGroup `
-            --container-image-name $imageFull `
-            --container-registry-url "https://$acrServer" `
-            --output none
+        # Ensure the Web App has credentials to pull from ACR. Try to read ACR admin creds and pass
+        # them to the update command (matches the creation path).
+        try {
+            $acrUser = az acr credential show --name $AcrName --query username -o tsv
+            $acrPass = az acr credential show --name $AcrName --query "passwords[0].value" -o tsv
+        } catch {
+            $acrUser = ""
+            $acrPass = ""
+        }
+
+        $containerCmd = @(
+            "--name", $WebAppName,
+            "--resource-group", $ResourceGroup,
+            "--container-image-name", $imageFull,
+            "--container-registry-url", "https://$acrServer"
+        )
+
+        if ($acrUser -and $acrPass) {
+            $containerCmd += @("--container-registry-user", $acrUser, "--container-registry-password", $acrPass)
+        }
+
+        az webapp config container set @containerCmd --output none
     } else {
         Write-Host "  Creating Web App with container image..."
 
