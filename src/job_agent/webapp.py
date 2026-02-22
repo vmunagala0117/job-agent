@@ -157,6 +157,7 @@ class UploadResponse(BaseModel):
     filename: str
     summary: str
     session_id: str
+    profile_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +407,7 @@ async def upload_resume(
             filename=filename,
             summary=summary,
             session_id=session.id,
+            profile_id=getattr(profile, "id", None) if profile is not None else None,
         )
 
     except Exception as exc:
