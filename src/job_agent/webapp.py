@@ -37,6 +37,7 @@ from .clients import build_azure_openai_client
 from .config import AppConfig
 from .models import ResponseFeedback, ResponseRating
 from .workflows import create_agent
+from .package_utils import packages_to_zip_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -419,6 +420,179 @@ async def upload_resume(
 async def get_traces(session_id: str):
     """Return trace log entries for a session."""
     return _trace_handler.get_traces(session_id)
+
+
+@app.get("/api/packages")
+async def list_packages(run_id: str | None = None, limit: int = 50):
+    """List application packages. If `run_id` is provided, return packages from that run's notification_channels."""
+    store = _services.get("store")
+    if not store:
+        raise HTTPException(status_code=503, detail="Store not available")
+
+    try:
+        packages = []
+        if run_id:
+            from .models import SearchRun
+            run = await store.get_search_run(run_id)
+            if not run:
+                raise HTTPException(status_code=404, detail="Run not found")
+            pkg_ids = getattr(run, "notification_channels", []) or []
+            for pid in pkg_ids:
+                p = await store.get_application_package(pid)
+                if p:
+                    packages.append(p)
+        else:
+            packages = await store.list_application_packages(limit=limit)
+
+        return [
+            {
+                "id": p.id,
+                "job_title": getattr(p.job, "title", ""),
+                "company": getattr(p.job, "company", ""),
+                "created_at": p.created_at.isoformat() if p.created_at else None,
+                "profile_name": getattr(p.profile, "name", ""),
+                "status": p.status,
+            }
+            for p in packages
+        ]
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to list packages: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+async def _resolve_package(store, pid: str):
+    """Resolve a package by id or short prefix. Returns package or None."""
+    # Try exact match first
+    p = await store.get_application_package(pid)
+    if p:
+        return p
+
+    # Fallback: match by prefix (useful when callers send 8-char short ids)
+    try:
+        # Try to scan recent packages to find a match
+        candidates = await store.list_application_packages(limit=200)
+        for c in candidates:
+            if getattr(c, "id", "").startswith(pid):
+                return c
+    except Exception:
+        # If store doesn't support listing or fails, just return None
+        return None
+    return None
+
+
+
+
+@app.get("/api/packages/download")
+async def download_packages(run_id: str | None = None, package_ids: str | None = None, formats: str = "txt,md"):
+    """Download a ZIP containing artifacts for the specified run or comma-separated package_ids.
+
+    Query params:
+      - run_id: ID of SearchRun to fetch package IDs from
+      - package_ids: comma-separated list of package IDs
+      - formats: comma-separated list of formats: txt,md,docx
+    """
+    store = _services.get("store")
+    if not store:
+        raise HTTPException(status_code=503, detail="Store not available")
+
+    try:
+        pkgs = []
+        if run_id:
+            run = await store.get_search_run(run_id)
+            if not run:
+                raise HTTPException(status_code=404, detail="Run not found")
+            pkg_ids = getattr(run, "notification_channels", []) or []
+            for pid in pkg_ids:
+                p = await store.get_application_package(pid)
+                if p:
+                    pkgs.append(p)
+        elif package_ids:
+            ids = [s.strip() for s in package_ids.split(",") if s.strip()]
+            for pid in ids:
+                p = await _resolve_package(store, pid)
+                if p:
+                    pkgs.append(p)
+        else:
+            # default: return recent packages
+            pkgs = await store.list_application_packages(limit=50)
+
+        if not pkgs:
+            raise HTTPException(status_code=404, detail="No packages found")
+
+        fmt_list = [f.strip().lower() for f in formats.split(",") if f.strip()]
+        logger.info("Building ZIP for %d packages (formats=%s)", len(pkgs), fmt_list)
+        try:
+            zip_bytes = packages_to_zip_bytes(pkgs, formats=fmt_list)
+        except Exception as exc:
+            logger.exception("packages_to_zip_bytes failed")
+            raise HTTPException(status_code=500, detail=f"Failed to render package ZIP: {exc}")
+
+        from fastapi.responses import StreamingResponse
+
+        def _iter():
+            yield zip_bytes
+
+        filename = f"packages_{run_id or pkgs[0].id[:8]}_{int(time.time())}.zip"
+        headers = {"Content-Disposition": f"attachment; filename=\"{filename}\""}
+        return StreamingResponse(_iter(), media_type="application/zip", headers=headers)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to build package ZIP: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/packages/{package_id}")
+async def get_package(package_id: str):
+    store = _services.get("store")
+    if not store:
+        raise HTTPException(status_code=503, detail="Store not available")
+    pkg = await _resolve_package(store, package_id)
+    if not pkg:
+        raise HTTPException(status_code=404, detail="Package not found")
+    return {
+        "id": pkg.id,
+        "job": {
+            "title": getattr(pkg.job, "title", ""),
+            "company": getattr(pkg.job, "company", ""),
+            "description": getattr(pkg.job, "description", ""),
+            "url": getattr(pkg.job, "url", ""),
+        },
+        "profile": {
+            "id": getattr(pkg.profile, "id", ""),
+            "name": getattr(pkg.profile, "name", ""),
+        },
+        "cover_letter": pkg.cover_letter,
+        "intro_email": pkg.intro_email,
+        "resume_suggestions": pkg.resume_suggestions,
+        "recruiters": pkg.recruiters,
+        "created_at": pkg.created_at.isoformat() if pkg.created_at else None,
+        "status": pkg.status,
+    }
+
+
+@app.get("/api/packages/{package_id}/download")
+async def download_single_package(package_id: str, formats: str = "txt,md"):
+    store = _services.get("store")
+    if not store:
+        raise HTTPException(status_code=503, detail="Store not available")
+    pkg = await _resolve_package(store, package_id)
+    if not pkg:
+        raise HTTPException(status_code=404, detail="Package not found")
+
+    fmt_list = [f.strip().lower() for f in formats.split(",") if f.strip()]
+    zip_bytes = packages_to_zip_bytes([pkg], formats=fmt_list)
+
+    from fastapi.responses import StreamingResponse
+
+    def _iter():
+        yield zip_bytes
+
+    filename = f"package_{package_id[:8]}_{int(time.time())}.zip"
+    headers = {"Content-Disposition": f"attachment; filename=\"{filename}\""}
+    return StreamingResponse(_iter(), media_type="application/zip", headers=headers)
 
 
 @app.get("/api/profiles")

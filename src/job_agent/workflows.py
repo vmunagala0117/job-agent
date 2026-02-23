@@ -961,6 +961,31 @@ class AppPrepTools:
             logger.error(f"Failed to prepare application: {e}")
             return f"Error preparing application: {e}"
 
+    async def download_packages(self, run_id: str | None = None, package_ids: str | None = None, formats: str = "md,txt") -> str:
+        """Return a downloadable URL for packages for a run or specific package IDs.
+
+        This tool does not assemble the ZIP itself — it returns the web endpoint
+        that the UI or user can open to download the ZIP generated on-demand.
+        """
+        try:
+            import os
+            base = os.environ.get("WEBAPP_BASE_URL", "")
+            # If base is empty, return relative path so UI will use same origin
+            if base:
+                # Ensure no trailing slash
+                base = base.rstrip("/")
+            # Build URL
+            if run_id:
+                url = f"{base}/api/packages/download?run_id={run_id}&formats={formats}" if base else f"/api/packages/download?run_id={run_id}&formats={formats}"
+            elif package_ids:
+                url = f"{base}/api/packages/download?package_ids={package_ids}&formats={formats}" if base else f"/api/packages/download?package_ids={package_ids}&formats={formats}"
+            else:
+                url = f"{base}/api/packages/download?formats={formats}" if base else f"/api/packages/download?formats={formats}"
+            return url
+        except Exception as e:
+            logger.exception("download_packages tool failed: %s", e)
+            return f"Error creating download URL: {e}"
+
     async def get_application_package(self, package_id: str) -> str:
         """Retrieve a previously generated application package.
 
@@ -1134,6 +1159,7 @@ class CoordinatorExecutor(Executor):
         if app_tools:
             app_prep_tools_list = [
                 app_tools.prepare_application,
+                app_tools.download_packages,
                 app_tools.get_application_package,
                 app_tools.analyze_job_fit,
             ]

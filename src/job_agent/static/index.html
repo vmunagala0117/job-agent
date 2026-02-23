@@ -70,6 +70,14 @@
                     </svg>
                     Traces
                 </button>
+                <button id="packages-btn" class="btn btn-secondary" title="Download packages from last run">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                        <polyline points="7 10 12 15 17 10"/>
+                        <line x1="12" y1="15" x2="12" y2="3"/>
+                    </svg>
+                    Packages
+                </button>
                 <button id="new-chat-btn" class="btn btn-secondary" title="New conversation">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                         <line x1="12" y1="5" x2="12" y2="19"/>
@@ -77,6 +85,7 @@
                     </svg>
                     New Chat
                 </button>
+                <!-- Packages panel toggle (opens packages side panel) -->
             </div>
         </header>
 
@@ -144,6 +153,27 @@
                 </div>
                 <div class="trace-entries" id="trace-entries">
                     <div class="trace-empty">No traces yet. Send a message to see agent activity.</div>
+                </div>
+            </aside>
+
+            <!-- Packages side panel -->
+            <aside class="packages-panel" id="packages-panel">
+                <div class="packages-header">
+                    <h3>Packages</h3>
+                    <button id="packages-refresh-btn" class="btn-icon" title="Refresh runs">
+                        ⟳
+                    </button>
+                </div>
+                <div class="packages-controls">
+                    <label for="packages-run-select">Select Run</label>
+                    <select id="packages-run-select"></select>
+                    <div style="margin-top:8px">
+                        <button id="packages-download-run" class="btn btn-sm btn-primary">Download Run ZIP</button>
+                        <button id="packages-download-selected" class="btn btn-sm">Download Selected</button>
+                    </div>
+                </div>
+                <div class="packages-list" id="packages-list">
+                    <div class="packages-empty">No packages yet. Run cron or refresh.</div>
                 </div>
             </aside>
         </div>
