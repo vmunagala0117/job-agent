@@ -357,7 +357,7 @@ async def upload_resume(
         parsed = await parser.parse_and_extract(
             file_data=file_b64,
             file_type=ext,
-            use_llm=False,
+            use_llm=True,
         )
 
         profile = parsed.to_user_profile()
@@ -1070,11 +1070,13 @@ async def cron_daily_search(request: Request, profile_id: str | None = None):
             prep_candidates = [j for j in recent_jobs[:10]
                                if j.score is not None and j.score > 0.3]
             if prep_candidates:
-                top5_ids = [j.id[:8] for j in prep_candidates[:5]]
+                # Prepare application packages for up to the top 10 prep candidates
+                top_n = min(len(prep_candidates), 10)
+                top_ids = [j.id[:8] for j in prep_candidates[:top_n]]
                 prep_msg = (
                     "For each of the following top job matches, prepare application "
                     "materials (cover letter, resume suggestions, and intro email). "
-                    "Job IDs: " + ", ".join(top5_ids)
+                    "Job IDs: " + ", ".join(top_ids)
                 )
                 session.messages.append(
                     ChatMessage(role=Role.USER, contents=[TextContent(text=prep_msg)])
@@ -1085,7 +1087,8 @@ async def cron_daily_search(request: Request, profile_id: str | None = None):
                 # Collect packages created in this window
                 from datetime import datetime, timedelta, timezone
                 cutoff = datetime.now(timezone.utc) - timedelta(minutes=10)
-                all_pkgs = await store.list_application_packages(limit=20)
+                # Increase the lookup window to ensure we capture all packages created
+                all_pkgs = await store.list_application_packages(limit=100)
                 for pkg in all_pkgs:
                     pkg_ts = pkg.created_at
                     if pkg_ts.tzinfo is None:

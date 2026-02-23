@@ -108,7 +108,34 @@ class ApplicationPrepService:
         
         Returns a list of specific changes to make to the resume.
         """
-        prompt = f"""Analyze this job posting and resume, then provide SPECIFIC suggestions for tailoring the resume.
+        # Use resume parsing helpers to feed explicit, labeled bullets into the prompt
+        from .resume_parser import create_parser
+
+        parser = create_parser()
+        # Limit raw resume context to a reasonable size
+        raw_resume = (profile.resume_text or "")[:8000]
+
+        # Extract experience entries and normalized skills for clear references
+        try:
+            entries = parser.extract_experience_entries(raw_resume)
+            normalized_skills = parser.normalize_skill_terms(profile.skills or [])
+        except Exception:
+            entries = []
+            normalized_skills = profile.skills or []
+
+        # Build a compact, labeled resume-bullets section so the LLM can reference exact bullets
+        resume_bullets = []
+        for e in entries[:4]:
+            label = (e.get("company") or e.get("title") or "Company").strip()
+            for idx, b in enumerate(e.get("bullets", [])[:3], start=1):
+                resume_bullets.append(f"Work Experience: {label} — bullet {idx}: {b}")
+
+        resume_bullets_text = "\n".join(resume_bullets) or (raw_resume[:1200] + ("..." if len(raw_resume) > 1200 else ""))
+        skills_text = ", ".join(normalized_skills[:40])
+
+        prompt = f"""You are an expert Executive Recruiter and Resume Optimizer.
+
+Analyze the Job Description and the candidate's resume. Provide 5-7 targeted, high-impact resume edits that increase ATS match and recruiter relevance.
 
 JOB POSTING:
 Title: {job.title}
@@ -116,25 +143,29 @@ Company: {job.company}
 Description:
 {job.description[:2000]}
 
-Required Skills: {', '.join(job.skills) if job.skills else 'Not specified'}
+Key skills (from JD): {', '.join(job.skills) if job.skills else 'Not specified'}
 
-CURRENT RESUME:
-{profile.resume_text}
+RESUME BULLETS (labeled excerpts from the candidate's resume):
+{resume_bullets_text}
 
-Skills: {', '.join(profile.skills)}
+Profile skills (normalized): {skills_text}
 Current Title: {profile.current_title}
 Years Experience: {profile.years_experience or 'Not specified'}
 
-Provide 5-7 SPECIFIC, ACTIONABLE suggestions in diff format. Each suggestion should:
-1. Reference a specific section or bullet point in the resume
-2. Explain what to change and why
-3. Be directly relevant to this job posting
+Requirements:
+- Provide 5-7 SPECIFIC suggestions.
+- Do NOT provide a full rewrite — only precise edits.
 
-Format each suggestion as:
-[SECTION] Specific change to make
-- Why: Brief justification tied to job requirements
+Output FORMAT (strictly follow):
+For each suggestion include these fields separated by a blank line:
+[SECTION] (e.g., Professional Summary, Work Experience: Company X, KEY SKILLS)
+Original: <the existing resume text or bullet you are modifying — quote briefly>
+Suggested Change: <exact replacement text or short rephrase — ATS-friendly and uses JD terminology>
+- Why: <1-2 lines tying the change to the JD, action verbs, and a measurable result if possible>
 
-Do NOT suggest a complete rewrite. Focus on targeted improvements."""
+Also at the end, output a short "Gap Analysis" listing any MUST-HAVE JD requirements missing from the resume (one-line bullets).
+
+Keep tone professional and use the JD's exact terminology where appropriate."""
 
         try:
             response = await self.client.chat.completions.create(
@@ -148,7 +179,7 @@ Do NOT suggest a complete rewrite. Focus on targeted improvements."""
             )
             
             suggestions_text = response.choices[0].message.content
-            # Parse into individual suggestions
+            # Return raw text blocks (each block follows the specified format)
             suggestions = [s.strip() for s in suggestions_text.split("\n\n") if s.strip()]
             return suggestions
             
@@ -162,30 +193,31 @@ Do NOT suggest a complete rewrite. Focus on targeted improvements."""
         profile: UserProfile,
     ) -> str:
         """Generate a concise, tailored cover letter draft."""
-        prompt = f"""Write a CONCISE cover letter for this job application.
+        prompt = f"""Act as a high-end Career Strategist and Persuasive Copywriter.
 
-JOB:
-Title: {job.title}
-Company: {job.company}
-Description (key points):
-{job.description[:1500]}
+    Write a concise, human-friendly cover letter that creates a clear "Value Bridge" between this Job Description and the candidate's experience.
 
-CANDIDATE:
-Name: {profile.name}
-Current Title: {profile.current_title}
-Key Skills: {', '.join(profile.skills[:10])}
-Years Experience: {profile.years_experience or 'Not specified'}
-Summary: {profile.summary or profile.resume_text[:2000]}
+    JOB:
+    Title: {job.title}
+    Company: {job.company}
+    Key points from description:
+    {job.description[:1500]}
 
-Requirements:
-1. Keep it under 250 words
-2. Open with a hook that shows genuine interest in {job.company}
-3. Highlight 2-3 specific qualifications that match the job
-4. Include a concrete achievement with metrics if possible
-5. Close with a clear call to action
-6. Be professional but personable - avoid generic phrases
+    CANDIDATE:
+    Name: {profile.name}
+    Current Title: {profile.current_title}
+    Top Skills: {', '.join(profile.skills[:10])}
+    Years Experience: {profile.years_experience or 'Not specified'}
+    Summary: {profile.summary or profile.resume_text[:2000]}
 
-Write the cover letter now:"""
+    Requirements (structure):
+    1) Hook: Start with a specific, non-generic reason you're drawn to {job.company} (no "I am writing to apply").
+    2) Requirement vs. Reality: For 2-3 key JD requirements, state "You’re looking for [Skill A] to solve [Problem B]. In my role at [Company], I used [Skill A] together with [unique approach] to achieve [specific result with metrics]."
+    3) Plus-One Value: Name 1-2 capabilities from the resume that aren't in the JD and explain how they'd help the team.
+    4) Tone: Professional, warm, conversational; avoid corporate buzzwords.
+    5) Closing: Confident, low-pressure call to action.
+
+    Keep under 250 words. Use concrete metrics where available. Produce the cover letter now."""
 
         try:
             response = await self.client.chat.completions.create(
@@ -212,29 +244,27 @@ Write the cover letter now:"""
     ) -> str:
         """Generate an intro email to send to a recruiter or hiring manager."""
         recipient = recruiter_name or "Hiring Manager"
-        
-        prompt = f"""Write a brief, professional email to a recruiter about this job opportunity.
 
-JOB:
-Title: {job.title}
-Company: {job.company}
+        prompt = f"""You are a Networking Expert and Relationship Builder.
 
-CANDIDATE:
-Name: {profile.name}
-Current Title: {profile.current_title}
-Key Skills: {', '.join(profile.skills[:5])}
+    Produce two outputs: (A) a concise outreach email (subject + body) suitable for email, and (B) a brief LinkedIn message (1-2 short paragraphs) to a recruiter about this specific job. Both should be low-pressure, show homework, and include one "extra" value.
 
-Requirements:
-1. Subject line that stands out (include job title)
-2. Keep the email under 100 words
-3. Get straight to the point
-4. Mention 1-2 relevant qualifications
-5. Request a conversation (not just "let me know")
-6. Professional but warm tone
+    JOB:
+    Title: {job.title}
+    Company: {job.company}
 
-To: {recipient}
+    CANDIDATE:
+    Name: {profile.name}
+    Current Title: {profile.current_title}
+    Top Skills: {', '.join(profile.skills[:5])}
 
-Write the email now (include subject line):"""
+    Constraints:
+    - Email: subject line that includes the job title; body under 100 words; ask for a conversation.
+    - LinkedIn message: ~50-80 words, mention a specific reason you're interested and one extra benefit you bring beyond the JD.
+
+    To: {recipient}
+
+    Write outputs labeled clearly as "EMAIL SUBJ:" and "EMAIL BODY:" then "LINKEDIN:" so they can be separated programmatically."""
 
         try:
             response = await self.client.chat.completions.create(

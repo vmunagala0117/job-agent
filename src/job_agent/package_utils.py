@@ -101,10 +101,116 @@ def packages_to_zip_bytes(packages: Iterable, formats: List[str] | None = None) 
                     if docb:
                         zf.writestr(f"{folder}/intro_email.docx", docb)
 
-                # Resume suggestions
-                rs_txt = render_resume_suggestions_txt(pkg)
-                if rs_txt:
-                    zf.writestr(f"{folder}/resume_suggestions.txt", rs_txt)
+                # Resume suggestions (plain text and improved Markdown)
+                rs_list = pkg.resume_suggestions or []
+                if rs_list:
+                    # Plain text (legacy)
+                    zf.writestr(f"{folder}/resume_suggestions.txt", "\n\n".join(rs_list))
+
+                    # Markdown rendering: parse LLM blocks into readable sections
+                    md_lines = ["# Resume Suggestions", ""]
+                    for block in rs_list:
+                        # Normalize line endings and strip
+                        blk = block.strip()
+                        if not blk:
+                            continue
+
+                        # If this block looks like a Gap Analysis, render specially
+                        if blk.lower().startswith("gap analysis"):
+                            md_lines.append("## Gap Analysis")
+                            for l in blk.splitlines()[1:]:
+                                l = l.strip()
+                                if not l:
+                                    continue
+                                # Ensure bullet formatting
+                                if not l.startswith("-"):
+                                    l = "- " + l
+                                md_lines.append(l)
+                            md_lines.append("")
+                            continue
+
+                        # Generic suggestion block parsing: find labeled fields
+                        lines = [l.rstrip() for l in blk.splitlines() if l.strip()]
+                        section = None
+                        original = []
+                        suggested = []
+                        why = []
+
+                        cur = None
+                        for ln in lines:
+                            low = ln.lower()
+                            if ln.startswith("[") and "]" in ln:
+                                # [SECTION] on first line
+                                section = ln.strip().lstrip("[").split("]")[0].strip()
+                                # capture remainder of line after ] if any
+                                rem = ln.split("]", 1)[1].strip()
+                                if rem:
+                                    # if remainder begins with 'Original:' move to that state
+                                    if rem.lower().startswith("original:"):
+                                        cur = 'original'
+                                        original.append(rem.split(':', 1)[1].strip())
+                                    else:
+                                        # treat as part of original
+                                        cur = 'original'
+                                        original.append(rem)
+                                continue
+                            if low.startswith("original:"):
+                                cur = 'original'
+                                original.append(ln.split(":", 1)[1].strip())
+                                continue
+                            if low.startswith("suggested change:") or low.startswith("suggested:"):
+                                cur = 'suggested'
+                                suggested.append(ln.split(":", 1)[1].strip())
+                                continue
+                            if "- why:" in low or low.startswith("why:") or low.startswith("- why"):
+                                cur = 'why'
+                                # remove leading markers
+                                cleaned = re.sub(r"^[-\s]*why:??\s*", "", ln, flags=re.I)
+                                why.append(cleaned.strip())
+                                continue
+
+                            # Append to current section if set
+                            if cur == 'original':
+                                original.append(ln)
+                            elif cur == 'suggested':
+                                suggested.append(ln)
+                            elif cur == 'why':
+                                why.append(ln)
+                            else:
+                                # If we haven't seen a label, attempt to infer: first line -> section
+                                if section is None:
+                                    m = re.match(r"^\[?([^\]]+)\]?", ln)
+                                    if m:
+                                        section = m.group(1).strip()
+                                        continue
+                                # default to treating as original
+                                original.append(ln)
+
+                        # Fallback section name
+                        if not section:
+                            section = "Suggestion"
+
+                        md_lines.append(f"### {section}")
+                        if original:
+                            md_lines.append("**Original:**")
+                            for o in original:
+                                md_lines.append(f"> {o}")
+                        if suggested:
+                            md_lines.append("")
+                            md_lines.append("**Suggested Change:**")
+                            md_lines.append("```text")
+                            for s in suggested:
+                                md_lines.append(s)
+                            md_lines.append("```")
+                        if why:
+                            md_lines.append("")
+                            md_lines.append("**Why:**")
+                            for w in why:
+                                md_lines.append(f"- {w}")
+
+                        md_lines.append("")
+
+                    zf.writestr(f"{folder}/resume_suggestions.md", "\n".join(md_lines))
 
                 # Job description
                 jd = render_job_description_txt(pkg)

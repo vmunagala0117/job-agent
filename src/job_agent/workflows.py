@@ -522,7 +522,7 @@ Description:
                 file_path=file_path,
                 file_data=file_data,
                 file_type=file_type,
-                use_llm=False,
+                use_llm=True,  # Use LLM to enhance extraction with context understanding
             )
 
             profile = parsed.to_user_profile()
