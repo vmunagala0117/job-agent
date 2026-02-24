@@ -115,6 +115,9 @@ The primary entry point, providing a full web UI with chat interface:
 | `POST` | `/api/feedback` | Submit thumbs up/down on response |
 | `GET` | `/api/feedback` | List feedback entries |
 | `POST` | `/api/chat/reset` | Reset conversation history |
+| `GET` | `/api/packages` | List application packages (accepts `?run_id=`) |
+| `GET` | `/api/packages/{id}` | Get application package details (JSON) |
+| `GET` | `/api/packages/download` | Download ZIP of packages. Supports `run_id=` or `package_ids=` and `formats=` |
 
 ---
 
@@ -370,6 +373,24 @@ The FastAPI `lifespan` handler initializes the agent once at startup. The agent,
 - `elapsed_ms` — End-to-end latency
 - `agent` — Which specialist handled the request
 - `tool_count` — Number of tool calls made
+
+### Application Packages
+
+The webapp exposes APIs to inspect and download generated application
+packages created by the `application_prep_agent` (cron or on-demand).
+
+- `GET /api/packages?run_id=<run>` — List packages created for a cron run
+- `GET /api/packages/{id}` — Return the package JSON (resume suggestions,
+  cover letter, intro email, and associated job metadata)
+- `GET /api/packages/download` — Return a ZIP archive for a run or a set of
+  package ids. Query parameters: `run_id=...` or `package_ids=id1,id2`, and
+  optional `formats=md,txt` to control artifact formats included in the ZIP.
+
+Package contents include `resume_suggestions.md` (a structured markdown
+file rendered from LLM blocks), `cover_letter.md` / `.txt`, `intro_email`,
+and a `metadata.txt` file containing `company`, `location`, `posting_date`,
+`salary`, and `job_url`. The packaging utility writes a `FAILURES.txt` if
+any artifact failed to render for a package.
 
 ### Profile Management
 

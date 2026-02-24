@@ -84,6 +84,7 @@ The system uses **classifier-based routing** — a lightweight LLM call with log
 | **Job Search** | SerpAPI Google Jobs (aggregates LinkedIn, Indeed, Glassdoor), embedding-based ranking with heuristic boosts |
 | **Profile Management** | Web-based profile form, PDF/DOCX resume upload with auto-extraction of skills/experience/title |
 | **Application Prep** | LLM-generated resume diff suggestions, cover letters, intro emails, job fit analysis |
+| **Packaging** | On-demand and cron-generated application package ZIPs (cover letter, resume_suggestions.md, intro email, metadata.txt). ZIPs include metadata (company, location, posting_date, salary, job_url) and a FAILURES.txt when per-package errors occur. |
 | **Notifications** | Console, email (SMTP), Microsoft Teams (webhooks), Slack (webhooks) |
 | **Feedback** | Thumbs up/down on responses, per-job feedback (good fit, not relevant, tailor resume, etc.) |
 | **Persistence** | PostgreSQL + pgvector for jobs, profiles, feedback, application packages |
@@ -221,6 +222,9 @@ Open [http://localhost:8000](http://localhost:8000) for the web UI.
 | `POST` | `/api/chat/reset` | Reset conversation |
 | `POST` | `/api/cron/daily-search` | Trigger automated job search (secured with `X-Cron-Key`) |
 | `GET` | `/api/cron/runs` | List cron search run history |
+| `GET` | `/api/packages` | List application packages for a cron run (`?run_id=...`) |
+| `GET` | `/api/packages/{id}` | Get application package JSON (resume suggestions, cover letter, emails) |
+| `GET` | `/api/packages/download` | Download ZIP of packages. Query args: `run_id=...` or `package_ids=id1,id2`, optional `formats=md,txt` |
 
 ## Usage Examples
 
@@ -283,7 +287,7 @@ The system supports automated daily job searches via an Azure Functions Timer Tr
    func azure functionapp publish <your-function-app>
    ```
 
-The cron endpoint iterates over all saved profiles, sends a synthetic message through the same agent pipeline used by the chat UI, persists results in the `job_search_runs` table, and returns a summary. View run history at `GET /api/cron/runs`.
+The cron endpoint iterates over all saved profiles, sends a synthetic message through the same agent pipeline used by the chat UI, persists results in the `job_search_runs` table, and returns a summary. The cron now prepares application packages for the top 10 ranked matches (previously top 5) and no longer filters out matches by a fixed score threshold — any non-null scored top match is considered for package generation. View run history at `GET /api/cron/runs`.
 
 ## Evaluation
 

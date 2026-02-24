@@ -195,15 +195,11 @@ These are stored in the `SearchRun.top_matches` field.
 
 ### Step 7 — Phase 2: Application Materials Generation
 
-The cron filters top matches for jobs scoring above **30%** and selects
-the best 5:
-
-```python
-prep_candidates = [j for j in recent_jobs[:10]
-                   if j.score is not None and j.score > 0.3]
-# → 9 jobs qualify (scores 0.92 → 0.35)
-# Takes first 5: Stripe, Microsoft, Databricks, Anthropic, Snowflake
-```
+Phase 2 prepares application materials for the top candidates discovered
+in Phase 1. Recent changes increased the candidate window and removed a
+hard score cutoff: the cron considers up to the top 10 scored matches and
+will prepare packages for any match with a non-null score (previously the
+pipeline selected the top 5 with score &gt; 0.3).
 
 A **second synthetic message** is sent into the *same session* (the agent
 retains context from Phase 1):
@@ -214,45 +210,24 @@ retains context from Phase 1):
  Job IDs: a1b2c3d4, e5f6g7h8, i9j0k1l2, m3n4o5p6, q7r8s9t0"
 ```
 
-The CoordinatorExecutor classifier routes this second message to the
-**app_prep_agent** (the specialist that owns `prepare_application`,
-`get_application_package`, and `find_recruiters`).
+The CoordinatorExecutor routes the request to the `application_prep_agent`,
+which generates an `ApplicationPackage` for each candidate. Each package
+is persisted in the `application_packages` table and the packaging utility
+assembles an in-memory ZIP containing structured artifacts and metadata.
 
-For each of the 5 jobs, the agent generates an `ApplicationPackage`:
+Typical package contents:
 
-| Material | Example (Stripe job) |
-|----------|---------------------|
-| **Cover Letter** | Tailored 3-paragraph letter highlighting Vivek's Python/FastAPI experience and Stripe's API-first culture |
-| **Resume Suggestions** | 4 diff-style suggestions: "Add 'distributed systems' to skills", "Quantify Azure migration: 40% cost reduction", etc. |
-| **Intro Email** | Short networking email template for the hiring manager |
+- `cover_letter.md` / `cover_letter.txt`
+- `resume_suggestions.md` (rendered from structured LLM output using the
+  standardized "Original / Suggested Change / Why" format)
+- `intro_email.md` / `intro_email.txt`
+- `metadata.txt` (company, location, posting_date, salary, job_url)
+- `FAILURES.txt` (only present when one or more per-package artifact
+  renderings fail)
 
-Each package is saved to the `application_packages` database table. The
-formatted summary also includes the job URL:
-
-```
-📋 APPLICATION PACKAGE
-==================================================
-Job: Staff Python Engineer at Stripe | 🔗 https://stripe.com/careers/12345
-Status: draft
-Created: 2026-02-14 06:01
-
-📝 RESUME SUGGESTIONS
-------------------------------
-1. Add "distributed systems" to technical skills section...
-2. Quantify Azure migration project: "Led migration of 12 services..."
-3. ...
-
-✉️ COVER LETTER DRAFT
-------------------------------
-Dear Hiring Manager,
-...
-```
-
-The cron collects all package IDs created within the last 10 minutes:
-
-```python
-package_ids = ["pkg-aaa111", "pkg-bbb222", "pkg-ccc333", "pkg-ddd444", "pkg-eee555"]
-```
+The cron looks up package IDs created in a recent window (the lookup
+window has been increased to be tolerant of asynchronous creation) and
+attaches them to the `SearchRun` record.
 
 ---
 

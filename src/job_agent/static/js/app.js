@@ -8,6 +8,17 @@
     // --- Configuration ---
     const API_BASE = "";  // Same origin
 
+    // Helper to build absolute API URLs. If `API_BASE` is empty, use window.location.origin.
+    function apiUrl(path) {
+        if (!path.startsWith('/')) path = '/' + path;
+        if (API_BASE && API_BASE.length > 0) {
+            // Strip possible trailing slash from API_BASE
+            const base = API_BASE.endsWith('/') ? API_BASE.slice(0, -1) : API_BASE;
+            return base + path;
+        }
+        return new URL(path, window.location.origin).href;
+    }
+
     // --- DOM refs ---
     const app           = document.querySelector(".app");
     const chatContainer = document.getElementById("chat-container");
@@ -487,29 +498,7 @@
         tracesBtn.classList.toggle("active");
     });
 
-    // Packages button — minimal: download ZIP for last cron run
-    if (packagesBtn) {
-        packagesBtn.addEventListener("click", async () => {
-            try {
-                const res = await fetch(`${API_BASE}/api/cron/runs`);
-                if (!res.ok) throw new Error(`HTTP ${res.status}`);
-                const runs = await res.json();
-                if (!runs || runs.length === 0) {
-                    addMessage("assistant", "No cron runs found to download packages from.");
-                    return;
-                }
-                const latest = runs[0];
-                const runId = latest.id;
-                // Trigger download in new tab/window
-                const url = `${API_BASE}/api/packages/download?run_id=${encodeURIComponent(runId)}&formats=txt,md`;
-                window.open(url, "_blank");
-                addMessage("assistant", `Preparing download for packages from run **${latest.profile_name}** (${new Date(latest.created_at).toLocaleString()})`);
-            } catch (e) {
-                console.error("Packages download error:", e);
-                addMessage("error", `Failed to initiate package download: ${e.message}`);
-            }
-        });
-    }
+    // Note: packages panel toggles later in the file (behaves like Traces).
 
     // Trace clear button
     traceClearBtn.addEventListener("click", clearTraces);
@@ -574,7 +563,7 @@
     // --- Packages UI ---
     async function loadRunsIntoSelect() {
         try {
-            const res = await fetch(`${API_BASE}/api/cron/runs`);
+            const res = await fetch(apiUrl('/api/cron/runs'));
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             const runs = await res.json();
             packagesRunSelect.innerHTML = "";
@@ -608,7 +597,7 @@
         if (!runId) return;
         packagesList.innerHTML = `<div class="packages-loading">Loading packages…</div>`;
         try {
-            const res = await fetch(`${API_BASE}/api/packages?run_id=${encodeURIComponent(runId)}`);
+            const res = await fetch(apiUrl(`/api/packages?run_id=${encodeURIComponent(runId)}`));
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             const pkgs = await res.json();
             if (!pkgs || pkgs.length === 0) {
@@ -639,7 +628,7 @@
             }));
             packagesList.querySelectorAll('.pkg-download').forEach(btn => btn.addEventListener('click', (e)=>{
                 const id = e.currentTarget.getAttribute('data-id');
-                const url = `${API_BASE}/api/packages/${encodeURIComponent(id)}/download?formats=md,txt`;
+                const url = apiUrl(`/api/packages/${encodeURIComponent(id)}/download?formats=md,txt`);
                 window.open(url, '_blank');
             }));
         } catch (e) {
@@ -650,7 +639,7 @@
 
     async function previewPackage(id) {
         try {
-            const res = await fetch(`${API_BASE}/api/packages/${encodeURIComponent(id)}`);
+            const res = await fetch(apiUrl(`/api/packages/${encodeURIComponent(id)}`));
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             const p = await res.json();
             const parts = [];
@@ -676,14 +665,14 @@
     if (packagesDownloadRunBtn) packagesDownloadRunBtn.addEventListener('click', () => {
         const runId = packagesRunSelect.value;
         if (!runId) { addMessage('error', 'No run selected'); return; }
-        const url = `${API_BASE}/api/packages/download?run_id=${encodeURIComponent(runId)}&formats=md,txt`;
+        const url = apiUrl(`/api/packages/download?run_id=${encodeURIComponent(runId)}&formats=md,txt`);
         window.open(url, '_blank');
     });
     if (packagesDownloadSelectedBtn) packagesDownloadSelectedBtn.addEventListener('click', () => {
         const checks = packagesList.querySelectorAll('input[type="checkbox"][data-pkgid]:checked');
         const ids = Array.from(checks).map(c => c.getAttribute('data-pkgid'));
         if (!ids.length) { addMessage('error', 'No packages selected'); return; }
-        const url = `${API_BASE}/api/packages/download?package_ids=${encodeURIComponent(ids.join(','))}&formats=md,txt`;
+        const url = apiUrl(`/api/packages/download?package_ids=${encodeURIComponent(ids.join(','))}&formats=md,txt`);
         window.open(url, '_blank');
     });
 
