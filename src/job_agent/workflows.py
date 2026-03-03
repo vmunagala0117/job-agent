@@ -66,7 +66,9 @@ notifications, feedback, or general greetings / small talk.
 
 APP_PREP — anything related to preparing application materials WHEN a user \
 profile already exists: tailored resume suggestions, cover letters, intro emails, \
-recruiter search, application packages, analyzing job fit.
+recruiter search, application packages, analyzing job fit. This includes when \
+the user provides an external job URL and asks to tailor a resume, create a \
+cover letter, or prepare application materials for that specific job.
 
 IMPORTANT: If the user mentions a resume FILE PATH or asks to upload/parse a \
 resume, classify as JOB_SEARCH (that's where the resume parser tool lives).
@@ -146,21 +148,52 @@ application materials for specific jobs.
 IMPORTANT: Always call get_profile() first to load the user's full profile, \
 skills, experience, and resume before generating any materials.
 
+CRITICAL — EXTERNAL JOB URLs:
+- If the user provides a URL to an external job posting (e.g., LinkedIn, Indeed, \
+  Oracle, Workday, Greenhouse, Lever, company career pages, etc.) and asks to \
+  tailor resume, create cover letter, or prepare materials for it:
+  1. Call fetch_external_job(url) FIRST to scrape the job and save it to the store.
+  2. Then use the returned job_id with prepare_application(job_id) or \
+     analyze_job_fit(job_id).
+  3. Do NOT call get_application_package("all") — the user wants materials for \
+     ONE specific external job, not bulk.
+
+IMPORTANT — WHEN TO USE BULK vs SINGLE:
+- If the user message contains a URL → ALWAYS use fetch_external_job first, \
+  then prepare_application for that one job. NEVER use bulk keywords.
+- If the user says "all", "the above", "for all of them" WITHOUT a URL → \
+  use get_application_package with bulk keywords.
+- If the user references a specific job ID → use prepare_application(job_id).
+
 CAPABILITIES:
+- Fetch external job postings from URLs (fetch_external_job)
 - Analyze how well a user's profile matches a specific job
 - Generate targeted resume diff suggestions (not full rewrites)
 - Draft concise, compelling cover letters
 - Create intro emails for recruiters/hiring managers
 - Package all materials for review (prepare_application)
 
-WORKFLOW:
-1. Call get_profile() to load the user's profile and resume
-2. If the user asks about a specific job, use analyze_job_fit first
-3. For complete application packages, use prepare_application
-4. To retrieve a previously created package, use get_application_package
+WORKFLOW & BULK OPERATIONS:
+1. Call get_profile() to load the user's profile and resume.
+2. If the user provides a URL → call fetch_external_job(url) first.
+3. If the user references a specific job, call analyze_job_fit(job_id) first.
+4. To create a package for ONE job, call prepare_application(job_id).
+5. To create packages for MULTIPLE jobs at once (user says "for all of them", \
+   "all", "the ones you found", "create packages for the above 20", etc.), \
+   call get_application_package with a BULK keyword:
+     - get_application_package("all")   → packages for the jobs from the CURRENT search
+     - get_application_package("top")   → packages for top 15 by score from search
+     - get_application_package("top:20") → packages for top 20 by score from search
+     - get_application_package("latest") → packages for 15 most recent from search
+   "all" means the jobs the user just searched for — NOT the entire database.
+   This is much faster than calling prepare_application per job.
+6. Do NOT ask the user for individual job IDs when they say "all" or \
+   "the above" — use the bulk keyword directly.
+7. To retrieve a previously created package, use get_application_package \
+   with the package ID.
 
-Be specific and actionable in your suggestions. Reference actual skills and \
-experience from the user's profile.
+Be specific and actionable. Reference actual skills and experience from the \
+user's profile.
 """
 
 
@@ -286,6 +319,14 @@ class JobSearchTools:
                 "month": "last month",
             }
             search_desc += f" [{date_labels.get(date_posted.lower(), date_posted)}]"
+
+        # Track these search result IDs so the app-prep agent can reference
+        # "all" / "top" without pulling the entire database.
+        # ACCUMULATE across multiple search_jobs calls (the agent often runs
+        # several queries in one session).  Deduplicate to avoid repeats.
+        prev = getattr(self.store, '_last_search_job_ids', []) or []
+        new_ids = [j.id for j in jobs if j.id not in set(prev)]
+        self.store._last_search_job_ids = prev + new_ids
 
         lines = [f"Found {len(jobs)} jobs matching '{search_desc}':"]
         for i, job in enumerate(jobs, 1):
@@ -970,31 +1011,160 @@ class AppPrepTools:
         try:
             import os
             base = os.environ.get("WEBAPP_BASE_URL", "")
-            # If base is empty, return relative path so UI will use same origin
-            if base:
-                # Ensure no trailing slash
-                base = base.rstrip("/")
+            if not base:
+                # Derive from common Azure App Service / local server env vars
+                host = os.environ.get("WEBSITE_HOSTNAME", "")
+                port = os.environ.get("PORT", os.environ.get("FUNCTIONS_CUSTOMHANDLER_PORT", "8080"))
+                if host:
+                    scheme = "https" if ".azurewebsites.net" in host or ".azure" in host else "http"
+                    base = f"{scheme}://{host}"
+                else:
+                    base = f"http://localhost:{port}"
+            base = base.rstrip("/")
             # Build URL
             if run_id:
-                url = f"{base}/api/packages/download?run_id={run_id}&formats={formats}" if base else f"/api/packages/download?run_id={run_id}&formats={formats}"
+                url = f"{base}/api/packages/download?run_id={run_id}&formats={formats}"
             elif package_ids:
-                url = f"{base}/api/packages/download?package_ids={package_ids}&formats={formats}" if base else f"/api/packages/download?package_ids={package_ids}&formats={formats}"
+                url = f"{base}/api/packages/download?package_ids={package_ids}&formats={formats}"
             else:
-                url = f"{base}/api/packages/download?formats={formats}" if base else f"/api/packages/download?formats={formats}"
+                url = f"{base}/api/packages/download?formats={formats}"
             return url
         except Exception as e:
             logger.exception("download_packages tool failed: %s", e)
             return f"Error creating download URL: {e}"
 
     async def get_application_package(self, package_id: str) -> str:
-        """Retrieve a previously generated application package.
+        """Retrieve a previously generated application package, or bulk-create
+        packages for multiple jobs.
+
+        Special bulk keywords (instead of a package ID):
+          - "all"      → create packages for every saved job
+          - "latest"   → create packages for the 15 most-recently-posted jobs
+          - "top"      → create packages for the top 15 jobs by score
+          - "top:<N>"  → create packages for the top N jobs by score
 
         Args:
-            package_id: The package ID (can be partial).
+            package_id: A package ID (partial OK), or one of the bulk keywords.
 
         Returns:
-            Formatted application package or error message.
+            Formatted application package, or a bulk-creation summary.
         """
+        import asyncio
+
+        from .models import SearchRun, SearchRunStatus
+        from .tools import get_current_profile
+
+        lookup = (package_id or "").strip().lower()
+
+        # ── Bulk-creation mode ──────────────────────────────────────
+        is_bulk = lookup in ("top", "top15", "all", "latest") or lookup.startswith("top:") or lookup.startswith("top-")
+        if is_bulk:
+            # Determine how many / which jobs to include
+            mode_all = lookup == "all"
+            mode_latest = lookup == "latest"
+            try:
+                if mode_all:
+                    k = None  # no limit — capped later
+                elif lookup in ("top", "top15"):
+                    k = 30
+                elif mode_latest:
+                    k = 30
+                else:
+                    # top:20, top-10, etc.
+                    num_part = lookup.split(":")[-1] if ":" in lookup else lookup.split("-")[-1]
+                    k = int(num_part) if num_part.isdigit() else 15
+            except Exception:
+                k = 15
+
+            profile = get_current_profile()
+            if not profile:
+                return "No user profile set. Upload a resume first."
+
+            # --- Scope to last search results, not the entire DB ---
+            last_ids = getattr(self.store, '_last_search_job_ids', [])
+            if last_ids:
+                # Fetch only the jobs from the most recent search
+                fetched = await asyncio.gather(
+                    *[self.store.get(jid) for jid in last_ids]
+                )
+                all_jobs = [j for j in fetched if j is not None]
+            else:
+                # Fallback: use list_all with a reasonable cap
+                all_jobs = await self.store.list_all(limit=50)
+
+            if not all_jobs:
+                return "No saved jobs. Run a job search first."
+
+            # Select & order
+            if mode_all:
+                ordered = all_jobs
+            elif mode_latest:
+                ordered = sorted(all_jobs, key=lambda j: j.posted_at or 0, reverse=True)
+                ordered = ordered[:k]
+            else:
+                ordered = sorted(all_jobs, key=lambda j: j.score or 0.0, reverse=True)
+                ordered = ordered[:k]
+
+            # Safety cap — never create more than 50 packages in one call
+            MAX_BULK = 50
+            if len(ordered) > MAX_BULK:
+                logger.warning("Bulk capped from %d to %d jobs", len(ordered), MAX_BULK)
+                ordered = ordered[:MAX_BULK]
+
+            # Create a SearchRun record (RUNNING) so the UI can track it
+            run = SearchRun(profile_id=profile.id, profile_name=profile.name)
+            run.jobs_found = len(ordered)
+            run.top_matches = [
+                {"id": j.id[:8], "title": j.title, "company": j.company,
+                 "score": j.score, "url": j.url}
+                for j in ordered[:20]
+            ]
+            run.status = SearchRunStatus.RUNNING
+            try:
+                await self.store.save_search_run(run)
+            except Exception:
+                logger.exception("Failed to save initial SearchRun")
+
+            # Create packages concurrently (semaphore + per-package timeout)
+            sem = asyncio.Semaphore(5)
+
+            async def _make(job):
+                async with sem:
+                    try:
+                        pkg = await asyncio.wait_for(
+                            self.app_prep.prepare_application(job, profile),
+                            timeout=120,
+                        )
+                        await self.store.save_application_package(pkg)
+                        return pkg
+                    except asyncio.TimeoutError:
+                        logger.warning("Package timed out for job %s", job.id)
+                    except Exception as exc:
+                        logger.exception("Package failed for %s: %s", job.id, exc)
+                return None
+
+            results = await asyncio.gather(*[_make(j) for j in ordered])
+            created = [r for r in results if r is not None]
+
+            # Finalise SearchRun
+            try:
+                run.notification_channels = [p.id for p in created]
+                run.status = SearchRunStatus.COMPLETED
+                await self.store.update_search_run(run)
+            except Exception:
+                logger.exception("Failed to finalise SearchRun")
+
+            if not created:
+                return "Failed to create any packages. Check logs for details."
+
+            lines = [f"Created {len(created)} application packages:"]
+            for p in created:
+                lines.append(f"- {p.job.title} at {p.job.company} [Package: {p.id[:8]}]")
+            lines.append(f"\nRun ID: {run.id}  — visible in Packages (select Run).")
+            lines.append("Use 'download_packages' to get a ZIP.")
+            return "\n".join(lines)
+
+        # ── Normal single-package lookup ────────────────────────────
         packages = await self.store.list_application_packages(limit=100)
         package = None
         for p in packages:
@@ -1083,6 +1253,148 @@ class AppPrepTools:
 
         return "\n".join(lines)
 
+    async def fetch_external_job(self, url: str) -> str:
+        """Fetch a job description from an external URL and save it to the store.
+
+        Scrapes the job posting page, extracts the title, company, description,
+        and other metadata, then saves it as a job in the store so it can be
+        used with prepare_application, analyze_job_fit, etc.
+
+        Args:
+            url: The full URL of the job posting (e.g., LinkedIn, Indeed, Oracle,
+                 Workday, Greenhouse, Lever, company career pages).
+
+        Returns:
+            A summary of the fetched job with its assigned job ID.
+        """
+        import hashlib
+        import re
+
+        try:
+            import httpx
+        except ImportError:
+            return "httpx is not installed. Run: pip install httpx"
+
+        from .models import Job
+
+        logger.info("Fetching external job URL: %s", url)
+
+        try:
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+            }
+
+            async with httpx.AsyncClient(
+                follow_redirects=True,
+                timeout=30.0,
+                verify=False,
+            ) as client:
+                resp = await client.get(url, headers=headers)
+                resp.raise_for_status()
+                html = resp.text
+
+        except httpx.HTTPStatusError as e:
+            return f"Failed to fetch URL (HTTP {e.response.status_code}): {url}"
+        except httpx.ConnectError:
+            return f"Could not connect to URL: {url}. Check the URL is correct."
+        except Exception as e:
+            return f"Error fetching URL: {e}"
+
+        # --- Extract text from HTML ---
+        clean = re.sub(r"<(script|style|noscript)[^>]*>.*?</\1>", "", html, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", "\n", clean)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        text = re.sub(r"[ \t]+", " ", text)
+        text = text.strip()
+
+        if len(text) < 100:
+            return (
+                f"Could not extract meaningful content from {url}. "
+                "The page may require JavaScript rendering or authentication. "
+                "Try copying the job description text and pasting it directly."
+            )
+
+        # Truncate to avoid token explosion
+        description = text[:8000]
+
+        # --- Use LLM to extract structured fields ---
+        title = "External Job"
+        company = "Unknown Company"
+        location = "Not specified"
+        skills: list[str] = []
+
+        try:
+            extract_prompt = (
+                "Extract the following fields from this job posting text. "
+                "Return ONLY valid JSON:\n"
+                '{\n  "title": "job title",\n  "company": "company name",\n'
+                '  "location": "job location",\n  "skills": ["skill1", "skill2"]\n}\n\n'
+                f"Job posting text (first 3000 chars):\n{description[:3000]}"
+            )
+
+            extract_resp = await self.app_prep.client.chat.completions.create(
+                model=self.app_prep.model,
+                messages=[
+                    {"role": "system", "content": "Extract structured job data from text. Return only JSON."},
+                    {"role": "user", "content": extract_prompt},
+                ],
+                max_tokens=300,
+                temperature=0,
+            )
+            raw = extract_resp.choices[0].message.content or ""
+            json_match = re.search(r"\{[^{}]*\}", raw, re.DOTALL)
+            if json_match:
+                data = json.loads(json_match.group())
+                title = data.get("title", title)
+                company = data.get("company", company)
+                location = data.get("location", location)
+                skills = data.get("skills", skills) or []
+        except Exception as e:
+            logger.warning("LLM extraction failed for external job: %s", e)
+            # Fallback: extract from <title> tag
+            title_match = re.search(r"<title[^>]*>([^<]+)</title>", html, re.IGNORECASE)
+            if title_match:
+                raw_title = title_match.group(1).strip()
+                for suffix in [" - Apply", " | Careers", " - Careers", " | Jobs"]:
+                    raw_title = raw_title.split(suffix)[0]
+                if len(raw_title) < 200:
+                    title = raw_title
+
+        # --- Create and save the job ---
+        job_id = hashlib.md5(url.encode()).hexdigest()[:16]
+
+        job = Job(
+            id=job_id,
+            title=title,
+            company=company,
+            location=location,
+            description=description,
+            url=url,
+            source="external",
+            skills=skills if isinstance(skills, list) else [],
+        )
+
+        await self.store.add_many([job])
+        logger.info("Saved external job: %s at %s [ID: %s]", title, company, job_id)
+
+        return (
+            f"Fetched and saved external job:\n"
+            f"- Title: {title}\n"
+            f"- Company: {company}\n"
+            f"- Location: {location}\n"
+            f"- Skills: {', '.join(skills[:10]) if skills else 'See description'}\n"
+            f"- Job ID: {job_id}\n"
+            f"- URL: {url}\n\n"
+            f"You can now use prepare_application('{job_id}') or "
+            f"analyze_job_fit('{job_id}') to generate tailored materials."
+        )
+
 
 # ---------------------------------------------------------------------------
 # Agent factory
@@ -1162,6 +1474,7 @@ class CoordinatorExecutor(Executor):
                 app_tools.download_packages,
                 app_tools.get_application_package,
                 app_tools.analyze_job_fit,
+                app_tools.fetch_external_job,
             ]
 
         self.app_prep_agent = client.create_agent(

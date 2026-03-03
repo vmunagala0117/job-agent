@@ -55,6 +55,8 @@
     const packagesList = document.getElementById("packages-list");
     const packagesDownloadRunBtn = document.getElementById("packages-download-run");
     const packagesDownloadSelectedBtn = document.getElementById("packages-download-selected");
+    const packagesCloseBtn = document.getElementById("packages-close-btn");
+    const packagesBackdrop = document.getElementById("packages-backdrop");
 
     // Profile modal elements
     const profileModal      = document.getElementById("profile-modal");
@@ -492,8 +494,11 @@
         if (file) uploadResume(file);
     });
 
-    // Trace panel toggle
+    // Trace panel toggle (with mutual exclusion)
     tracesBtn.addEventListener("click", () => {
+        const willOpen = !app.classList.contains("traces-open");
+        // Close packages panel first if open
+        if (willOpen) closePackagesPanel();
         app.classList.toggle("traces-open");
         tracesBtn.classList.toggle("active");
     });
@@ -607,33 +612,88 @@
             packagesList.innerHTML = "";
             pkgs.forEach((p) => {
                 const el = document.createElement('div');
-                el.className = 'package-item';
+                el.className = 'pkg-item';
                 el.innerHTML = `
-                    <label class="pkg-checkbox"><input type="checkbox" data-pkgid="${p.id}"> </label>
-                    <div class="pkg-main">
-                        <div class="pkg-title">${escapeHtml(p.job_title || 'Untitled')}</div>
-                        <div class="pkg-meta">${escapeHtml(p.company || '')} — ${p.created_at ? new Date(p.created_at).toLocaleString() : ''}</div>
+                    <div class="pkg-toggle" role="button" tabindex="0">
+                        <svg class="pkg-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+                        <label class="pkg-checkbox"><input type="checkbox" data-pkgid="${p.id}"></label>
+                        <div class="pkg-info">
+                            <div class="pkg-title">${escapeHtml(p.job_title || 'Untitled')}</div>
+                            <div class="pkg-meta">${escapeHtml(p.company || '')} — ${p.created_at ? new Date(p.created_at).toLocaleString() : ''}</div>
+                        </div>
                     </div>
-                    <div class="pkg-actions">
-                        <button class="btn btn-sm pkg-preview" data-id="${p.id}">Preview</button>
-                        <button class="btn btn-sm pkg-download" data-id="${p.id}">Download</button>
+                    <div class="pkg-body">
+                        <div class="pkg-actions">
+                            <button class="btn btn-sm btn-primary pkg-preview-inline" data-id="${p.id}">Preview</button>
+                            <button class="btn btn-sm pkg-download" data-id="${p.id}">Download</button>
+                        </div>
+                        <div class="pkg-detail" data-id="${p.id}"></div>
                     </div>
                 `;
                 packagesList.appendChild(el);
             });
-            // attach handlers
-            packagesList.querySelectorAll('.pkg-preview').forEach(btn => btn.addEventListener('click', (e)=>{
-                const id = e.currentTarget.getAttribute('data-id');
-                previewPackage(id);
-            }));
-            packagesList.querySelectorAll('.pkg-download').forEach(btn => btn.addEventListener('click', (e)=>{
+
+            // Toggle expand/collapse — skip clicks on checkboxes
+            packagesList.querySelectorAll('.pkg-toggle').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    // Don't toggle when clicking the checkbox or its label
+                    if (e.target.closest('.pkg-checkbox')) return;
+                    const item = e.currentTarget.closest('.pkg-item');
+                    const wasOpen = item.classList.contains('open');
+                    item.classList.toggle('open');
+                    // Lazy-load preview on first open
+                    if (!wasOpen) {
+                        const detailDiv = item.querySelector('.pkg-detail');
+                        if (!detailDiv.dataset.loaded) {
+                            loadInlinePreview(detailDiv.getAttribute('data-id'), detailDiv);
+                        }
+                    }
+                });
+            });
+
+            // Download buttons
+            packagesList.querySelectorAll('.pkg-download').forEach(btn => btn.addEventListener('click', (e) => {
+                e.stopPropagation();
                 const id = e.currentTarget.getAttribute('data-id');
                 const url = apiUrl(`/api/packages/${encodeURIComponent(id)}/download?formats=md,txt`);
                 window.open(url, '_blank');
             }));
+
+            // Inline preview buttons
+            packagesList.querySelectorAll('.pkg-preview-inline').forEach(btn => btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const id = e.currentTarget.getAttribute('data-id');
+                const detailDiv = e.currentTarget.closest('.pkg-body').querySelector('.pkg-detail');
+                loadInlinePreview(id, detailDiv);
+            }));
         } catch (e) {
             console.error('Failed to load packages:', e);
             packagesList.innerHTML = `<div class="packages-empty">Failed to load packages.</div>`;
+        }
+    }
+
+    async function loadInlinePreview(id, container) {
+        container.innerHTML = `<div class="packages-loading" style="padding:8px 0">Loading preview…</div>`;
+        try {
+            const res = await fetch(apiUrl(`/api/packages/${encodeURIComponent(id)}`));
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const p = await res.json();
+            container.dataset.loaded = "1";
+
+            const sections = [];
+            if (p.resume_suggestions && p.resume_suggestions.length) {
+                sections.push(`<div class="pkg-section"><div class="pkg-section-title">Resume Suggestions</div><div class="pkg-section-content">${escapeHtml(p.resume_suggestions.join('\n'))}</div></div>`);
+            }
+            if (p.cover_letter) {
+                sections.push(`<div class="pkg-section"><div class="pkg-section-title">Cover Letter</div><div class="pkg-section-content">${escapeHtml(p.cover_letter)}</div></div>`);
+            }
+            if (p.intro_email) {
+                sections.push(`<div class="pkg-section"><div class="pkg-section-title">Intro Email</div><div class="pkg-section-content">${escapeHtml(p.intro_email)}</div></div>`);
+            }
+            container.innerHTML = sections.join('') || '<div class="packages-empty" style="padding:8px 0">No content available.</div>';
+        } catch (e) {
+            console.error('Preview failed:', e);
+            container.innerHTML = `<div class="packages-empty" style="padding:8px 0;color:var(--color-error)">Preview failed: ${escapeHtml(e.message)}</div>`;
         }
     }
 
@@ -676,16 +736,56 @@
         window.open(url, '_blank');
     });
 
-    // Toggle packages panel when packagesBtn clicked
-    if (packagesBtn) {
-        packagesBtn.addEventListener('click', async () => {
-            app.classList.toggle('packages-open');
-            packagesBtn.classList.toggle('active');
-            if (app.classList.contains('packages-open')) {
-                await loadRunsIntoSelect();
-            }
-        });
+    // ---- Packages panel open / close helpers ----
+    function openPackagesPanel() {
+        // Close traces first (mutual exclusion)
+        if (app.classList.contains('traces-open')) {
+            app.classList.remove('traces-open');
+            tracesBtn.classList.remove('active');
+        }
+        app.classList.add('packages-open');
+        packagesBtn.classList.add('active');
+        loadRunsIntoSelect();
     }
+
+    function closePackagesPanel() {
+        app.classList.remove('packages-open');
+        packagesBtn.classList.remove('active');
+    }
+
+    function togglePackagesPanel() {
+        if (app.classList.contains('packages-open')) {
+            closePackagesPanel();
+        } else {
+            openPackagesPanel();
+        }
+    }
+
+    // Toggle via header button
+    if (packagesBtn) {
+        packagesBtn.addEventListener('click', () => togglePackagesPanel());
+    }
+
+    // Close via panel X button
+    if (packagesCloseBtn) {
+        packagesCloseBtn.addEventListener('click', () => closePackagesPanel());
+    }
+
+    // Close via click outside the panel (replaces backdrop overlay)
+    document.addEventListener('mousedown', (e) => {
+        if (!app.classList.contains('packages-open')) return;
+        // If clicking inside the panel or on the packages toggle button, do nothing
+        if (packagesPanel && packagesPanel.contains(e.target)) return;
+        if (packagesBtn && packagesBtn.contains(e.target)) return;
+        closePackagesPanel();
+    });
+
+    // Close via Escape key
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && app.classList.contains('packages-open')) {
+            closePackagesPanel();
+        }
+    });
 
     // --- Profile Modal Logic ---
 

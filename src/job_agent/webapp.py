@@ -243,6 +243,23 @@ app = FastAPI(
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
+# Development helper: avoid aggressive caching of static assets so UI updates
+# (CSS/JS) are visible immediately during local development. In production
+# you may want to remove or gate this behind a config flag.
+@app.middleware("http")
+async def _no_cache_static_middleware(request: Request, call_next):
+    resp = await call_next(request)
+    try:
+        if request.url.path.startswith("/static") or request.url.path == "/":
+            # Ensure browsers revalidate assets
+            resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            resp.headers["Pragma"] = "no-cache"
+            resp.headers["Expires"] = "0"
+    except Exception:
+        pass
+    return resp
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -437,10 +454,13 @@ async def list_packages(run_id: str | None = None, limit: int = 50):
             if not run:
                 raise HTTPException(status_code=404, detail="Run not found")
             pkg_ids = getattr(run, "notification_channels", []) or []
-            for pid in pkg_ids:
-                p = await store.get_application_package(pid)
-                if p:
-                    packages.append(p)
+            if pkg_ids:
+                # Batch-fetch packages concurrently instead of N+1 queries
+                import asyncio
+                results = await asyncio.gather(
+                    *[store.get_application_package(pid) for pid in pkg_ids]
+                )
+                packages = [p for p in results if p is not None]
         else:
             packages = await store.list_application_packages(limit=limit)
 
@@ -953,6 +973,10 @@ async def reset_session(req: ChatRequest):
     if session_id and session_id in _sessions:
         del _sessions[session_id]
         _trace_handler.clear_session(session_id)
+    # Clear accumulated search-result IDs so a new session starts clean
+    store = _services.get("store")
+    if store and hasattr(store, '_last_search_job_ids'):
+        store._last_search_job_ids = []
     new_session = _get_or_create_session(None)
     return SessionInfo(session_id=new_session.id, message_count=0)
 

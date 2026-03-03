@@ -32,3 +32,6 @@ htmlcov/
 # Docker
 .git
 .gitignore
+ .python_packages
+azure-functions/daily-search/.python_packages
+azure-functions/daily-search/.python_packages/**

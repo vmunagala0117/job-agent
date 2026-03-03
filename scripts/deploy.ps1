@@ -220,11 +220,35 @@ if (-not $SkipWebApp) {
     Write-Host "  Building image via ACR Tasks (cloud build)..."
     Write-Host "  This may take 2-5 minutes on first build..."
 
+    # Temporarily move Azure Functions local package folder out of the build context
+    $pythonPackagesPath = Join-Path $repoRoot "azure-functions\daily-search\.python_packages"
+    $tempBackup = Join-Path $env:TEMP ("daily-search-.python_packages-backup-" + (Get-Random))
+    $movedPythonPackages = $false
+    if (Test-Path $pythonPackagesPath) {
+        try {
+            Move-Item -Path $pythonPackagesPath -Destination $tempBackup -Force -ErrorAction Stop
+            $movedPythonPackages = $true
+            Write-Ok "Temporarily moved .python_packages to $tempBackup"
+        } catch {
+            Write-Warn "Could not move .python_packages: $($_.Exception.Message) - continuing and hoping it's not locked"
+        }
+    }
+
     az acr build `
         --registry $AcrName `
         --image "job-agent:${ImageTag}" `
         --file $dockerfilePath `
         $repoRoot
+
+    # Restore the .python_packages folder if we moved it
+    if ($movedPythonPackages) {
+        try {
+            Move-Item -Path $tempBackup -Destination $pythonPackagesPath -Force -ErrorAction Stop
+            Write-Ok "Restored .python_packages from $tempBackup"
+        } catch {
+            Write-Warn "Failed to restore .python_packages: $($_.Exception.Message)"
+        }
+    }
 
     Write-Ok "Image pushed: $imageFull"
 
