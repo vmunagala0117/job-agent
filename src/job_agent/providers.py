@@ -7,10 +7,12 @@ import random
 from typing import Optional
 
 import aiohttp
+from opentelemetry import trace
 
 from .models import Job, JobSearchCriteria
 
 logger = logging.getLogger(__name__)
+_tracer = trace.get_tracer("job_agent.providers")
 
 
 class JobIngestionProvider(ABC):
@@ -134,84 +136,91 @@ class SerpAPIJobProvider(JobIngestionProvider):
     
     async def fetch_jobs(self, criteria: JobSearchCriteria) -> list[Job]:
         """Fetch jobs from Google Jobs via SerpAPI."""
-        from .models import DatePosted
-        
-        # Build the search query
-        query = criteria.query
-        
-        # Handle remote preference - add "remote" to query text (this works better than chips)
-        is_remote_search = criteria.remote_only or (
-            criteria.location and criteria.location.lower() in ("remote", "remote only", "work from home")
-        )
-        
-        if is_remote_search:
-            # Add "remote" to query text - this mimics what users type on Google
-            if "remote" not in query.lower():
-                query = f"{query} remote"
-        
-        # Add date filter as query text (more reliable than chips)
-        date_suffix = criteria.date_posted.query_suffix if criteria.date_posted else ""
-        if date_suffix:
-            query = f"{query} {date_suffix}"
-        
-        # Clean location - don't include "remote" as a location
-        clean_location = None
-        if criteria.location:
-            loc_lower = criteria.location.lower()
-            if loc_lower not in ("remote", "remote only", "work from home"):
-                clean_location = criteria.location
-        
-        params = {
-            "engine": "google_jobs",
-            "q": query,
-            "api_key": self._api_key,
-        }
-        
-        # Add location parameter if specified (but not "Remote")
-        if clean_location:
-            params["location"] = clean_location
-        elif is_remote_search:
-            # For remote searches, use United States as base location
-            params["location"] = "United States"
-        
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(self.GOOGLE_JOBS_URL, params=params) as response:
-                    if response.status != 200:
-                        error_text = await response.text()
-                        logger.error(f"SerpAPI request failed: {response.status} - {error_text}")
-                        print(f"SerpAPI request failed: {response.status} - {error_text}")
-                        return []
+        with _tracer.start_as_current_span("provider.serpapi.fetch_jobs") as span:
+            span.set_attribute("provider.query", criteria.query)
+            span.set_attribute("provider.location", criteria.location or "")
+            span.set_attribute("provider.remote_only", criteria.remote_only)
+            logger.info("[PROVIDER] SerpAPI fetch: query=%r location=%r remote=%s",
+                        criteria.query, criteria.location, criteria.remote_only)
+            from .models import DatePosted
+            
+            # Build the search query
+            query = criteria.query
+            
+            # Handle remote preference - add "remote" to query text (this works better than chips)
+            is_remote_search = criteria.remote_only or (
+                criteria.location and criteria.location.lower() in ("remote", "remote only", "work from home")
+            )
+            
+            if is_remote_search:
+                # Add "remote" to query text - this mimics what users type on Google
+                if "remote" not in query.lower():
+                    query = f"{query} remote"
+            
+            # Add date filter as query text (more reliable than chips)
+            date_suffix = criteria.date_posted.query_suffix if criteria.date_posted else ""
+            if date_suffix:
+                query = f"{query} {date_suffix}"
+            
+            # Clean location - don't include "remote" as a location
+            clean_location = None
+            if criteria.location:
+                loc_lower = criteria.location.lower()
+                if loc_lower not in ("remote", "remote only", "work from home"):
+                    clean_location = criteria.location
+            
+            params = {
+                "engine": "google_jobs",
+                "q": query,
+                "api_key": self._api_key,
+            }
+            
+            # Add location parameter if specified (but not "Remote")
+            if clean_location:
+                params["location"] = clean_location
+            elif is_remote_search:
+                # For remote searches, use United States as base location
+                params["location"] = "United States"
+            
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(self.GOOGLE_JOBS_URL, params=params) as response:
+                        if response.status != 200:
+                            error_text = await response.text()
+                            logger.error(f"SerpAPI request failed: {response.status} - {error_text}")
+                            print(f"SerpAPI request failed: {response.status} - {error_text}")
+                            return []
+                        
+                        data = await response.json()
+            except aiohttp.ClientError as e:
+                logger.error(f"SerpAPI connection error: {e}")
+                return []
+            
+            # Parse the response
+            jobs_data = data.get("jobs_results", [])
+            
+            if not jobs_data:
+                logger.info(f"No jobs found for query: {criteria.query}")
+                return []
+            
+            jobs = []
+            for job_data in jobs_data[:criteria.max_results * 2]:  # Fetch extra in case we filter
+                job = self._parse_job(job_data)
+                if job:
+                    # Apply client-side salary filter if specified
+                    if criteria.min_salary:
+                        # Only filter if job has salary data
+                        if job.salary_max is not None and job.salary_max < criteria.min_salary:
+                            continue  # Skip jobs below salary requirement
+                        # Jobs without salary data are included (don't filter them out)
                     
-                    data = await response.json()
-        except aiohttp.ClientError as e:
-            logger.error(f"SerpAPI connection error: {e}")
-            return []
-        
-        # Parse the response
-        jobs_data = data.get("jobs_results", [])
-        
-        if not jobs_data:
-            logger.info(f"No jobs found for query: {criteria.query}")
-            return []
-        
-        jobs = []
-        for job_data in jobs_data[:criteria.max_results * 2]:  # Fetch extra in case we filter
-            job = self._parse_job(job_data)
-            if job:
-                # Apply client-side salary filter if specified
-                if criteria.min_salary:
-                    # Only filter if job has salary data
-                    if job.salary_max is not None and job.salary_max < criteria.min_salary:
-                        continue  # Skip jobs below salary requirement
-                    # Jobs without salary data are included (don't filter them out)
-                
-                jobs.append(job)
-                if len(jobs) >= criteria.max_results:
-                    break
-        
-        logger.info(f"Fetched {len(jobs)} jobs from SerpAPI for: {criteria.query}")
-        return jobs
+                    jobs.append(job)
+                    if len(jobs) >= criteria.max_results:
+                        break
+            
+            logger.info("[PROVIDER] SerpAPI returned %d jobs for: %s", len(jobs), criteria.query)
+            span.set_attribute("provider.result_count", len(jobs))
+            return jobs
     
     def _parse_job(self, data: dict) -> Optional[Job]:
         """Parse a single job from SerpAPI response."""

@@ -7,10 +7,13 @@ Produces an in-memory ZIP (bytes) suitable for streaming via FastAPI.
 from __future__ import annotations
 
 import io
+import logging
 import zipfile
 import datetime
 import re
 from typing import Iterable, List
+
+logger = logging.getLogger(__name__)
 
 def _sanitize_filename(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9 _\-\.]+", "_", name)[:200]
@@ -48,6 +51,7 @@ def _render_docx_bytes_from_text(text: str, title: str = "Document") -> bytes | 
     try:
         from docx import Document
     except Exception:
+        logger.debug("python-docx not installed, skipping DOCX rendering")
         return None
 
     doc = Document()
@@ -72,6 +76,7 @@ def packages_to_zip_bytes(packages: Iterable, formats: List[str] | None = None) 
     if formats is None:
         formats = ["txt", "md"]
 
+    logger.info("[PKG] Building ZIP for packages (formats=%s)", formats)
     buf = io.BytesIO()
     errors = []
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -258,6 +263,7 @@ def packages_to_zip_bytes(packages: Iterable, formats: List[str] | None = None) 
             except Exception as exc:
                 # Record the failure and continue with other packages
                 pkg_id = getattr(pkg, "id", "<unknown>")
+                logger.error("[PKG] Failed to render package %s: %s", pkg_id, exc)
                 errors.append(f"Package {pkg_id} failed: {exc}")
 
         # If there were errors, add a top-level failures.txt describing them

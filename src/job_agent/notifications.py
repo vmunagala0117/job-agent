@@ -10,10 +10,12 @@ from email.mime.text import MIMEText
 from typing import Optional
 
 import httpx
+from opentelemetry import trace
 
 from .models import NotificationChannel, NotificationConfig, RankedJob, UserProfile
 
 logger = logging.getLogger(__name__)
+_tracer = trace.get_tracer("job_agent.notifications")
 
 
 class NotificationSender(ABC):
@@ -201,6 +203,9 @@ class NotificationService:
         """
         if not ranked_jobs:
             return {}
+        
+        logger.info("[NOTIFY] Sending %d job matches for %s via %d channels",
+                    len(ranked_jobs), profile.name, len(self.senders))
         
         # Build notification content
         subject = f"🎯 {title} - {len(ranked_jobs)} matches for {profile.name}"

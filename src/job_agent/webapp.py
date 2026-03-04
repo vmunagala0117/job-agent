@@ -29,6 +29,7 @@ from typing import Any
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from opentelemetry import trace
 from pydantic import BaseModel
 
 from agent_framework import ChatMessage, Role, TextContent
@@ -40,6 +41,7 @@ from .workflows import create_agent
 from .package_utils import packages_to_zip_bytes
 
 logger = logging.getLogger(__name__)
+_tracer = trace.get_tracer("job_agent.webapp")
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +288,7 @@ async def chat(req: ChatRequest):
         raise HTTPException(status_code=400, detail="Message cannot be empty")
 
     session = _get_or_create_session(req.session_id)
+    logger.info("[WEBAPP] /api/chat session=%s msg_len=%d", session.id[:8], len(req.message))
 
     # Point the trace handler at this session
     _trace_handler.set_session(session.id)
@@ -360,6 +363,7 @@ async def upload_resume(
 
     session = _get_or_create_session(session_id)
     _trace_handler.set_session(session.id)
+    logger.info("[WEBAPP] /api/upload-resume file=%s ext=%s session=%s", filename, ext, session.id[:8])
 
     try:
         # Read and base64-encode for the parser
@@ -1161,14 +1165,14 @@ async def cron_daily_search(request: Request, profile_id: str | None = None):
 
 @app.get("/api/cron/runs")
 async def list_cron_runs(limit: int = 20):
-    """List recent automated search runs."""
+    """List recent runs that produced application packages."""
     store = _services.get("store")
     if not store:
         return []
 
     from .models import SearchRun  # noqa: F811
 
-    runs = await store.list_search_runs(limit=limit)
+    runs = await store.list_search_runs(limit=limit, with_packages_only=True)
     return [
         {
             "id": r.id,
@@ -1176,6 +1180,7 @@ async def list_cron_runs(limit: int = 20):
             "search_keywords": r.search_keywords,
             "jobs_found": r.jobs_found,
             "top_matches": r.top_matches,
+            "packages_count": len(r.notification_channels) if r.notification_channels else 0,
             "status": r.status.value,
             "error_message": r.error_message,
             "duration_ms": r.duration_ms,
@@ -1192,13 +1197,78 @@ async def list_cron_runs(limit: int = 20):
 def main():
     """Run the web application with uvicorn."""
     import uvicorn
+    from logging.handlers import RotatingFileHandler
+    import pathlib
 
+    log_fmt = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s"
+
+    # --- Console handler (same as before) ---
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+        format=log_fmt,
     )
+
+    # --- File handler (rotates at 10 MB, keeps 5 backups) ---
+    log_dir = pathlib.Path(os.getenv("LOG_DIR", "logs"))
+    log_file = os.getenv("LOG_FILE", "job_agent.log")
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    file_handler = RotatingFileHandler(
+        log_dir / log_file,
+        maxBytes=10 * 1024 * 1024,   # 10 MB
+        backupCount=5,
+        encoding="utf-8",
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(log_fmt))
+    logging.getLogger().addHandler(file_handler)
+
+    # --- Silence noisy third-party loggers ---------------------------
+    # These flood the log file with Azure SDK HTTP headers, telemetry
+    # export confirmations, and framework internals every few seconds.
+    # They still go to Application Insights via OTel; we just don't
+    # need them in the local file / console.
+    _noisy_loggers = [
+        "azure.core.pipeline.policies.http_logging_policy",
+        "azure.monitor.opentelemetry.exporter",
+        "azure.identity",
+        "httpx",
+        "httpcore",
+        "opentelemetry.sdk",
+    ]
+    for name in _noisy_loggers:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
     # Show agent traces
     logging.getLogger("job_agent.workflows").setLevel(logging.INFO)
+
+    # --- Azure Blob handler (opt-in via env var) ---
+    blob_conn_str = os.getenv("AZURE_BLOB_LOG_CONNECTION_STRING", "").strip()
+    if blob_conn_str:
+        try:
+            from .blob_log_handler import AzureBlobLogHandler
+
+            blob_handler = AzureBlobLogHandler(
+                connection_string=blob_conn_str,
+                container_name=os.getenv("AZURE_BLOB_LOG_CONTAINER", "app-logs"),
+                blob_prefix=os.getenv("AZURE_BLOB_LOG_PREFIX", "job_agent"),
+                flush_interval=float(os.getenv("AZURE_BLOB_LOG_FLUSH_INTERVAL", "30")),
+            )
+            blob_handler.setLevel(logging.INFO)
+            blob_handler.setFormatter(logging.Formatter(log_fmt))
+            logging.getLogger().addHandler(blob_handler)
+            logging.getLogger(__name__).info(
+                "Azure Blob logging enabled → container=%s",
+                os.getenv("AZURE_BLOB_LOG_CONTAINER", "app-logs"),
+            )
+        except ImportError:
+            logging.getLogger(__name__).warning(
+                "azure-storage-blob not installed — blob logging disabled"
+            )
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Failed to initialise Azure Blob log handler"
+            )
 
     uvicorn.run(
         "job_agent.webapp:app",

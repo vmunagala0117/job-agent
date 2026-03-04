@@ -5,11 +5,13 @@ from dataclasses import dataclass
 from typing import Optional
 
 from openai import AsyncAzureOpenAI
+from opentelemetry import trace
 
 from .config import AzureOpenAIConfig
 from .models import ApplicationPackage, Job, UserProfile
 
 logger = logging.getLogger(__name__)
+_tracer = trace.get_tracer("job_agent.application_prep")
 
 
 @dataclass
@@ -77,7 +79,10 @@ class ApplicationPrepService:
         Returns:
             ApplicationPackage with all generated materials
         """
-        logger.info(f"Preparing application for {job.title} at {job.company}")
+        with _tracer.start_as_current_span("app_prep.prepare_application") as span:
+            span.set_attribute("job.title", job.title)
+            span.set_attribute("job.company", job.company)
+            logger.info("[APP_PREP] Preparing application for %s at %s", job.title, job.company)
         
         # Generate all materials
         resume_suggestions = await self.generate_resume_suggestions(job, profile)
@@ -108,8 +113,11 @@ class ApplicationPrepService:
         
         Returns a list of specific changes to make to the resume.
         """
-        # Use resume parsing helpers to feed explicit, labeled bullets into the prompt
-        from .resume_parser import create_parser
+        with _tracer.start_as_current_span("app_prep.generate_resume_suggestions") as span:
+            span.set_attribute("job.title", job.title)
+            logger.info("[APP_PREP] Generating resume suggestions for %s", job.title)
+            # Use resume parsing helpers to feed explicit, labeled bullets into the prompt
+            from .resume_parser import create_parser
 
         parser = create_parser()
         # Limit raw resume context to a reasonable size
@@ -120,6 +128,7 @@ class ApplicationPrepService:
             entries = parser.extract_experience_entries(raw_resume)
             normalized_skills = parser.normalize_skill_terms(profile.skills or [])
         except Exception:
+            logger.warning("[APP_PREP] Resume structured extraction failed, using raw text")
             entries = []
             normalized_skills = profile.skills or []
 
@@ -181,10 +190,12 @@ Keep tone professional and use the JD's exact terminology where appropriate."""
             suggestions_text = response.choices[0].message.content
             # Return raw text blocks (each block follows the specified format)
             suggestions = [s.strip() for s in suggestions_text.split("\n\n") if s.strip()]
+            logger.info("[APP_PREP] Generated %d resume suggestions", len(suggestions))
             return suggestions
             
         except Exception as e:
-            logger.error(f"Failed to generate resume suggestions: {e}")
+            logger.error("[APP_PREP] Failed to generate resume suggestions: %s", e)
+            span.record_exception(e)
             return [f"Error generating suggestions: {e}"]
     
     async def generate_cover_letter(
@@ -193,7 +204,10 @@ Keep tone professional and use the JD's exact terminology where appropriate."""
         profile: UserProfile,
     ) -> str:
         """Generate a concise, tailored cover letter draft."""
-        prompt = f"""Act as a high-end Career Strategist and Persuasive Copywriter.
+        with _tracer.start_as_current_span("app_prep.generate_cover_letter") as span:
+            span.set_attribute("job.title", job.title)
+            logger.info("[APP_PREP] Generating cover letter for %s at %s", job.title, job.company)
+            prompt = f"""Act as a high-end Career Strategist and Persuasive Copywriter.
 
     Write a concise, human-friendly cover letter that creates a clear "Value Bridge" between this Job Description and the candidate's experience.
 
@@ -219,22 +233,24 @@ Keep tone professional and use the JD's exact terminology where appropriate."""
 
     Keep under 250 words. Use concrete metrics where available. Produce the cover letter now."""
 
-        try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "You are a professional writer who creates compelling, concise cover letters."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=self.prep_config.temperature,
-                max_completion_tokens=800,
-            )
-            
-            return response.choices[0].message.content.strip()
-            
-        except Exception as e:
-            logger.error(f"Failed to generate cover letter: {e}")
-            return f"Error generating cover letter: {e}"
+            try:
+                response = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": "You are a professional writer who creates compelling, concise cover letters."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=self.prep_config.temperature,
+                    max_completion_tokens=800,
+                )
+                
+                logger.info("[APP_PREP] Cover letter generated")
+                return response.choices[0].message.content.strip()
+                
+            except Exception as e:
+                logger.error("[APP_PREP] Failed to generate cover letter: %s", e)
+                span.record_exception(e)
+                return f"Error generating cover letter: {e}"
     
     async def generate_intro_email(
         self,
@@ -243,7 +259,10 @@ Keep tone professional and use the JD's exact terminology where appropriate."""
         recruiter_name: Optional[str] = None,
     ) -> str:
         """Generate an intro email to send to a recruiter or hiring manager."""
-        recipient = recruiter_name or "Hiring Manager"
+        with _tracer.start_as_current_span("app_prep.generate_intro_email") as span:
+            span.set_attribute("job.title", job.title)
+            logger.info("[APP_PREP] Generating intro email for %s", job.title)
+            recipient = recruiter_name or "Hiring Manager"
 
         prompt = f"""You are a Networking Expert and Relationship Builder.
 
@@ -277,10 +296,12 @@ Keep tone professional and use the JD's exact terminology where appropriate."""
                 max_completion_tokens=400,
             )
             
+            logger.info("[APP_PREP] Intro email generated")
             return response.choices[0].message.content.strip()
             
         except Exception as e:
-            logger.error(f"Failed to generate intro email: {e}")
+            logger.error("[APP_PREP] Failed to generate intro email: %s", e)
+            span.record_exception(e)
             return f"Error generating intro email: {e}"
     
     async def find_recruiters(

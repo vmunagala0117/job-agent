@@ -201,6 +201,21 @@ user's profile.
 # Job Search tools
 # ---------------------------------------------------------------------------
 
+
+def _match_badge(score_pct: float) -> str:
+    """Return a coloured emoji badge for a match-score percentage.
+
+    🟢 ≥ 70%  (Great match)
+    🟡 ≥ 45%  (Good / worth a look)
+    🔴  < 45% (Low match)
+    """
+    if score_pct >= 70:
+        return "🟢"
+    if score_pct >= 45:
+        return "🟡"
+    return "🔴"
+
+
 class JobSearchTools:
     """Tool implementations for the Job Search Agent."""
 
@@ -214,6 +229,7 @@ class JobSearchTools:
         deployment_name: str = "",
     ):
         self.store = store
+        self.ranking_service = ranking_service
         self.provider = provider
         self.ranking_service = ranking_service
         self.notification_service = notification_service
@@ -245,6 +261,7 @@ class JobSearchTools:
         Returns:
             A formatted string with matching job listings.
         """
+        logger.info("[TRACE] search_jobs: query=%r location=%r remote=%s", query, location, remote_only)
         # Detect "remote" passed as location
         if location and location.lower() in ("remote", "remote only", "work from home"):
             remote_only = True
@@ -333,7 +350,11 @@ class JobSearchTools:
             salary = ""
             if job.salary_min and job.salary_max:
                 salary = f" | ${job.salary_min:,}-${job.salary_max:,}"
-            score_str = f" | Match: {round(job.score * 100, 1)}%" if job.score else ""
+            score_str = ""
+            if job.score is not None:
+                pct = round(job.score * 100, 1)
+                badge = _match_badge(pct)
+                score_str = f" | {badge} {pct}%"
             link = f" | 🔗 {job.url}" if job.url else ""
             lines.append(
                 f"{i}. {job.title} at {job.company} ({job.location}){salary}{score_str}{link} [ID: {job.id[:8]}]"
@@ -554,6 +575,7 @@ Description:
         Returns:
             Confirmation with extracted profile details.
         """
+        logger.info("[TRACE] upload_resume: file_path=%s file_type=%s", file_path, file_type)
         if not file_path and not (file_data and file_type):
             return "Please provide either file_path or (file_data and file_type)."
 
@@ -593,6 +615,7 @@ Description:
         except ValueError as e:
             return f"Error parsing resume: {e}"
         except Exception as e:
+            logger.error("[TRACE] upload_resume failed: %s", e, exc_info=True)
             return f"Failed to parse resume: {e}"
 
     async def rank_saved_jobs(self, top_k: int = 10) -> str:
@@ -604,6 +627,7 @@ Description:
         Returns:
             A formatted string with ranked jobs, scores, and justifications.
         """
+        logger.info("[TRACE] rank_saved_jobs: top_k=%d", top_k)
         profile = get_current_profile()
         if not profile:
             return "No user profile set. Please provide your resume or skills first using set_user_profile."
@@ -625,7 +649,9 @@ Description:
         for i, rj in enumerate(ranked_jobs, 1):
             job = rj.job
             score_pct = round(rj.score * 100, 1)
-            lines.append(f"\n{i}. {job.title} at {job.company} - Score: {score_pct}%")
+            badge = _match_badge(score_pct)
+            lines.append(f"\n{i}. {badge} {job.title} at {job.company} — {score_pct}% match")
+            lines.append(f"   📊 Similarity {round(rj.similarity_score*100)}% · Skills {round(rj.skill_match_score*100)}% · Location {round(rj.location_score*100)}% · Salary {round(rj.salary_score*100)}%")
             lines.append(f"   {rj.justification}")
             if job.url:
                 lines.append(f"   🔗 {job.url}")
@@ -979,6 +1005,7 @@ class AppPrepTools:
         Returns:
             Formatted application package for review.
         """
+        logger.info("[TRACE] prepare_application: job_id=%s", job_id)
         profile = get_current_profile()
         if not profile:
             return "No user profile set. Upload a resume first via the job search agent."
@@ -1279,47 +1306,31 @@ class AppPrepTools:
 
         logger.info("Fetching external job URL: %s", url)
 
+        # Use the safer fetcher implemented in tools.RankingTools which includes
+        # SSRF protections, timeouts and size limits. Fall back to asking the
+        # user to paste the job description on failure.
         try:
-            headers = {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-            }
+            from .tools import RankingTools
 
-            async with httpx.AsyncClient(
-                follow_redirects=True,
-                timeout=30.0,
-                verify=False,
-            ) as client:
-                resp = await client.get(url, headers=headers)
-                resp.raise_for_status()
-                html = resp.text
-
-        except httpx.HTTPStatusError as e:
-            return f"Failed to fetch URL (HTTP {e.response.status_code}): {url}"
-        except httpx.ConnectError:
-            return f"Could not connect to URL: {url}. Check the URL is correct."
+            fetcher = RankingTools(self.store, None)
+            fetched = await fetcher.fetch_job_description_from_url(url, timeout=15, max_bytes=512000)
         except Exception as e:
-            return f"Error fetching URL: {e}"
-
-        # --- Extract text from HTML ---
-        clean = re.sub(r"<(script|style|noscript)[^>]*>.*?</\1>", "", html, flags=re.DOTALL | re.IGNORECASE)
-        text = re.sub(r"<[^>]+>", "\n", clean)
-        text = re.sub(r"\n{3,}", "\n\n", text)
-        text = re.sub(r"[ \t]+", " ", text)
-        text = text.strip()
-
-        if len(text) < 100:
+            logger.exception("Safe fetcher failed: %s", e)
             return (
-                f"Could not extract meaningful content from {url}. "
-                "The page may require JavaScript rendering or authentication. "
-                "Try copying the job description text and pasting it directly."
+                f"Failed to fetch URL: {e}. "
+                "You can paste the job description text directly instead."
             )
 
+        if not fetched.get("ok"):
+            err = fetched.get("error") or "unknown error"
+            return (
+                f"Could not fetch or extract job text from the URL: {err}. "
+                "The page may require JavaScript rendering or authentication. "
+                "Please paste the job description text directly."
+            )
+
+        # Use the extracted text as the job description (already truncated by fetcher)
+        text = fetched.get("text", "")
         # Truncate to avoid token explosion
         description = text[:8000]
 
@@ -1357,14 +1368,17 @@ class AppPrepTools:
                 skills = data.get("skills", skills) or []
         except Exception as e:
             logger.warning("LLM extraction failed for external job: %s", e)
-            # Fallback: extract from <title> tag
-            title_match = re.search(r"<title[^>]*>([^<]+)</title>", html, re.IGNORECASE)
-            if title_match:
-                raw_title = title_match.group(1).strip()
-                for suffix in [" - Apply", " | Careers", " - Careers", " | Jobs"]:
-                    raw_title = raw_title.split(suffix)[0]
-                if len(raw_title) < 200:
-                    title = raw_title
+            # Fallback: use the first non-empty line/sentence from the extracted
+            # description as a best-effort title when structured extraction fails.
+            first_line = ""
+            if description:
+                for ln in description.splitlines():
+                    ln = ln.strip()
+                    if ln:
+                        first_line = ln
+                        break
+            if first_line and len(first_line) < 200:
+                title = first_line
 
         # --- Create and save the job ---
         job_id = hashlib.md5(url.encode()).hexdigest()[:16]
@@ -1439,6 +1453,7 @@ class CoordinatorExecutor(Executor):
             openai_client=openai_client, deployment_name=deployment_name,
         )
         app_tools = AppPrepTools(store, application_prep_service) if application_prep_service else None
+        self.app_tools = app_tools
 
         # --- Classifier (no tools, cheap routing call) ---
         self.classifier = client.create_agent(
@@ -1506,19 +1521,136 @@ class CoordinatorExecutor(Executor):
         request_start = time.time()
         usage_totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
-        # Log the user's message for trace context
+        # Log the user's message for trace context and detect URLs
         user_msg = ""
+        user_text = ""
         if messages:
             last = messages[-1]
             if last.contents:
                 for c in last.contents:
                     if hasattr(c, "text") and c.text:
+                        user_text = c.text
                         user_msg = c.text[:120]
                         break
         logger.info("[TRACE] User message: %s", user_msg)
 
+        # ── URL interception ─────────────────────────────────────────────
+        # When the user's message contains an http(s) URL we attempt a quick
+        # safe fetch *before* routing to the classifier / specialist agent.
+        #   • Success → inject the extracted JD text into the user message and
+        #     let the specialist agent use it (no second fetch needed).
+        #   • Failure → return immediately with a paste-JD fallback so the
+        #     agent never gets stuck waiting on an unreachable page.
+        #
+        # "Fetch JD" (explicit command) also lands here — we search prior
+        # messages for the URL.
+        # ────────────────────────────────────────────────────────────────────
+        try:
+            import re
+
+            url_pattern = r"https?://[^\s'\"]+"
+            is_fetch_cmd = bool(re.match(r"^\s*fetch\s+jd\s*$", user_text or "", re.I))
+
+            # Determine the target URL
+            if is_fetch_cmd:
+                logger.info("[TRACE] 'Fetch JD' command detected — scanning history for URLs")
+                target_url = None
+                for m in reversed(messages[:-1]):
+                    if m.contents:
+                        for c in m.contents:
+                            if hasattr(c, "text") and c.text:
+                                match = re.search(url_pattern, c.text)
+                                if match:
+                                    target_url = match.group(0)
+                                    break
+                        if target_url:
+                            break
+                if not target_url:
+                    logger.warning("[TRACE] No URL found in history for 'Fetch JD'")
+                    await ctx.yield_output(
+                        "I couldn't find a URL in your previous messages. "
+                        "Please paste the job link or the job description text."
+                    )
+                    return
+            else:
+                # Check the current message for a URL
+                url_match = re.search(url_pattern, user_text or "")
+                target_url = url_match.group(0) if url_match else None
+
+            if target_url:
+                logger.info("[TRACE] URL detected for pre-fetch: %s", target_url)
+
+                with _tracer.start_as_current_span("url_prefetch") as span:
+                    span.set_attribute("prefetch.url", target_url)
+                    span.set_attribute("prefetch.is_fetch_cmd", is_fetch_cmd)
+
+                    from .tools import RankingTools
+                    fetcher = RankingTools(self.store, None)
+
+                    try:
+                        fetch_start = time.time()
+                        fetched = await fetcher.fetch_job_description_from_url(
+                            target_url, timeout=10, max_bytes=512000,
+                        )
+                        elapsed = round((time.time() - fetch_start) * 1000)
+                        span.set_attribute("prefetch.elapsed_ms", elapsed)
+                        span.set_attribute("prefetch.ok", fetched.get("ok", False))
+                    except Exception as exc:
+                        elapsed = round((time.time() - fetch_start) * 1000)
+                        span.set_attribute("prefetch.elapsed_ms", elapsed)
+                        span.set_attribute("prefetch.ok", False)
+                        span.set_attribute("prefetch.error", str(exc))
+                        logger.warning("[TRACE] Pre-fetch exception for %s: %s (%dms)", target_url, exc, elapsed)
+                        fetched = {"ok": False, "error": str(exc)}
+
+                    if fetched.get("ok") and fetched.get("text"):
+                        jd_text = fetched["text"][:6000]
+                        logger.info(
+                            "[TRACE] Pre-fetch succeeded: %d chars extracted from %s in %dms",
+                            len(jd_text), target_url, elapsed,
+                        )
+                        span.set_attribute("prefetch.text_length", len(jd_text))
+
+                        # Inject extracted JD into the last user message so the
+                        # specialist agent has the content without re-fetching.
+                        injected_text = (
+                            f"{user_text}\n\n"
+                            f"--- Extracted job description from {target_url} ---\n"
+                            f"{jd_text}\n"
+                            f"--- End of extracted job description ---"
+                        )
+                        # Replace the text in the last message's content
+                        for c in messages[-1].contents:
+                            if hasattr(c, "text"):
+                                c.text = injected_text
+                                break
+                        logger.info("[TRACE] JD injected into message, falling through to classifier")
+                        # Fall through to classifier — the specialist agent will
+                        # see the JD in the conversation and can use it directly.
+                    else:
+                        err = fetched.get("error", "unknown")
+                        logger.warning(
+                            "[TRACE] Pre-fetch FAILED for %s: %s (%dms) — returning paste-JD fallback immediately",
+                            target_url, err, elapsed,
+                        )
+                        span.set_attribute("prefetch.error", err)
+
+                        # Return immediately — do NOT fall through to the
+                        # specialist agent which would re-attempt the same
+                        # fetch and hang.
+                        await ctx.yield_output(
+                            f"I couldn't extract the job description from the URL ({err}).\n"
+                            "The page likely requires JavaScript rendering or login.\n\n"
+                            "**Please copy the job description text from the page and paste it here** "
+                            "— I'll use that to tailor your resume and application materials."
+                        )
+                        return
+        except Exception as url_exc:
+            logger.exception("[TRACE] URL interception block raised an unexpected error: %s", url_exc)
+            # Continue to normal classification
+
         # 1. Classify intent — use direct OpenAI call for logprobs if available
-        logger.info("[TRACE] Classifying user intent...")
+        logger.info("[TRACE] CHECKPOINT 1: Starting intent classification (%.1fs since request start)", time.time() - request_start)
         confidence = None
         intent = "JOB_SEARCH"  # default
 
@@ -1580,21 +1712,23 @@ class CoordinatorExecutor(Executor):
             intent = (classification.text or "").strip().upper()
 
         conf_str = f" (confidence: {confidence}%)" if confidence is not None else ""
-        logger.info("[TRACE] Classifier → %s%s", intent, conf_str)
+        logger.info("[TRACE] CHECKPOINT 2: Classifier → %s%s (%.1fs since start)", intent, conf_str, time.time() - request_start)
 
         # 2. Route to the appropriate specialist
         with _tracer.start_as_current_span("specialist_agent") as agent_span:
             if "APP_PREP" in intent:
                 agent_name = "application_prep_agent"
-                logger.info("[TRACE] Routing to Application Prep Agent (3 tools)")
+                logger.info("[TRACE] CHECKPOINT 3: Routing to Application Prep Agent (%.1fs since start)", time.time() - request_start)
                 response = await self.app_prep_agent.run(messages)
             else:
                 agent_name = "job_search_agent"
-                logger.info("[TRACE] Routing to Job Search Agent (12 tools)")
+                logger.info("[TRACE] CHECKPOINT 3: Routing to Job Search Agent (%.1fs since start)", time.time() - request_start)
                 response = await self.job_search_agent.run(messages)
 
             agent_span.set_attribute("agent.name", agent_name)
             agent_span.set_attribute("agent.intent", intent)
+
+        logger.info("[TRACE] CHECKPOINT 4: Specialist agent returned (%.1fs since start)", time.time() - request_start)
 
         # Track specialist agent token usage
         if hasattr(response, "usage_details") and response.usage_details:
@@ -1662,7 +1796,7 @@ class CoordinatorExecutor(Executor):
             elapsed_ms,
         )
 
-        logger.info("[TRACE] Response length: %d chars", len(response.text or ""))
+        logger.info("[TRACE] CHECKPOINT 5: Response length: %d chars (%.1fs since start)", len(response.text or ""), time.time() - request_start)
 
         # 4. Yield final text + metadata for the HTTP response body
         #    Pack usage and confidence into a JSON metadata suffix that

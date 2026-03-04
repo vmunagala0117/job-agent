@@ -1,14 +1,19 @@
 """Ranking service for matching jobs to user profiles using embeddings."""
 
 import asyncio
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional
 
 from openai import AsyncAzureOpenAI
+from opentelemetry import trace
 
 from .config import AzureOpenAIConfig
 from .models import Job, RankedJob, UserProfile
+
+logger = logging.getLogger(__name__)
+_tracer = trace.get_tracer("job_agent.ranking")
 
 
 class EmbeddingService(ABC):
@@ -52,23 +57,40 @@ class AzureOpenAIEmbeddingService(EmbeddingService):
     
     async def embed(self, text: str) -> list[float]:
         """Generate embedding for a single text."""
-        response = await self.client.embeddings.create(
-            input=text,
-            model=self.model,
-        )
-        return response.data[0].embedding
+        with _tracer.start_as_current_span("embedding.single") as span:
+            span.set_attribute("embedding.model", self.model)
+            span.set_attribute("embedding.input_length", len(text))
+            try:
+                response = await self.client.embeddings.create(
+                    input=text,
+                    model=self.model,
+                )
+                logger.debug("[EMBED] Single embedding generated (%d dims)", len(response.data[0].embedding))
+                return response.data[0].embedding
+            except Exception as exc:
+                logger.error("[EMBED] Single embedding failed: %s", exc)
+                span.record_exception(exc)
+                raise
     
     async def embed_batch(self, texts: list[str]) -> list[list[float]]:
         """Generate embeddings for multiple texts."""
         if not texts:
             return []
         
-        # Azure OpenAI supports batch embedding
-        response = await self.client.embeddings.create(
-            input=texts,
-            model=self.model,
-        )
-        return [d.embedding for d in response.data]
+        with _tracer.start_as_current_span("embedding.batch") as span:
+            span.set_attribute("embedding.model", self.model)
+            span.set_attribute("embedding.batch_size", len(texts))
+            try:
+                response = await self.client.embeddings.create(
+                    input=texts,
+                    model=self.model,
+                )
+                logger.info("[EMBED] Batch embedding: %d texts → %d vectors", len(texts), len(response.data))
+                return [d.embedding for d in response.data]
+            except Exception as exc:
+                logger.error("[EMBED] Batch embedding failed (%d texts): %s", len(texts), exc)
+                span.record_exception(exc)
+                raise
 
 
 class MockEmbeddingService(EmbeddingService):
@@ -134,15 +156,19 @@ class RankingService:
     
     async def embed_user_profile(self, profile: UserProfile) -> UserProfile:
         """Generate and store embedding for user profile."""
-        # Combine resume and summary for embedding
-        text = f"{profile.summary}\n\n{profile.resume_text}"
-        if profile.skills:
-            text += f"\n\nSkills: {', '.join(profile.skills)}"
-        if profile.desired_titles:
-            text += f"\n\nDesired roles: {', '.join(profile.desired_titles)}"
-        
-        profile.embedding = await self.embedding_service.embed(text)
-        return profile
+        with _tracer.start_as_current_span("ranking.embed_user_profile") as span:
+            span.set_attribute("profile.name", profile.name or "")
+            logger.info("[RANK] Embedding user profile: %s", profile.name)
+            # Combine resume and summary for embedding
+            text = f"{profile.summary}\n\n{profile.resume_text}"
+            if profile.skills:
+                text += f"\n\nSkills: {', '.join(profile.skills)}"
+            if profile.desired_titles:
+                text += f"\n\nDesired roles: {', '.join(profile.desired_titles)}"
+            
+            profile.embedding = await self.embedding_service.embed(text)
+            logger.info("[RANK] Profile embedded successfully")
+            return profile
     
     async def embed_jobs(self, jobs: list[Job]) -> list[Job]:
         """Generate embeddings for jobs that don't have them.
@@ -155,17 +181,24 @@ class RankingService:
         # Find jobs that need embeddings
         jobs_needing_embeddings = [j for j in jobs if j.embedding is None]
         if not jobs_needing_embeddings:
+            logger.debug("[RANK] All %d jobs already have embeddings", len(jobs))
             return jobs
         
-        # Generate embeddings for jobs without them
-        job_texts = [self._job_to_text(job) for job in jobs_needing_embeddings]
-        embeddings = await self.embedding_service.embed_batch(job_texts)
-        
-        # Assign embeddings to jobs
-        for job, embedding in zip(jobs_needing_embeddings, embeddings):
-            job.embedding = embedding
-        
-        return jobs
+        with _tracer.start_as_current_span("ranking.embed_jobs") as span:
+            span.set_attribute("jobs.total", len(jobs))
+            span.set_attribute("jobs.needing_embeddings", len(jobs_needing_embeddings))
+            logger.info("[RANK] Embedding %d/%d jobs", len(jobs_needing_embeddings), len(jobs))
+
+            # Generate embeddings for jobs without them
+            job_texts = [self._job_to_text(job) for job in jobs_needing_embeddings]
+            embeddings = await self.embedding_service.embed_batch(job_texts)
+            
+            # Assign embeddings to jobs
+            for job, embedding in zip(jobs_needing_embeddings, embeddings):
+                job.embedding = embedding
+            
+            logger.info("[RANK] Job embeddings complete")
+            return jobs
     
     async def rank_jobs(
         self,
@@ -177,33 +210,40 @@ class RankingService:
         if not jobs:
             return []
         
-        # Ensure profile has embedding
-        if profile.embedding is None:
-            profile = await self.embed_user_profile(profile)
-        
-        # Generate embeddings only for jobs that don't have them
-        jobs_needing_embeddings = [(i, j) for i, j in enumerate(jobs) if j.embedding is None]
-        if jobs_needing_embeddings:
-            indices, jobs_to_embed = zip(*jobs_needing_embeddings)
-            job_texts = [self._job_to_text(job) for job in jobs_to_embed]
-            new_embeddings = await self.embedding_service.embed_batch(job_texts)
-            for idx, embedding in zip(indices, new_embeddings):
-                jobs[idx].embedding = embedding
-        
-        # Score each job using its embedding
-        ranked_jobs = []
-        for job in jobs:
-            ranked_job = self._score_job(job, job.embedding, profile)
-            ranked_jobs.append(ranked_job)
-        
-        # Sort by score descending
-        ranked_jobs.sort(key=lambda rj: rj.score, reverse=True)
-        
-        # Return top K if specified
-        if top_k is not None:
-            ranked_jobs = ranked_jobs[:top_k]
-        
-        return ranked_jobs
+        with _tracer.start_as_current_span("ranking.rank_jobs") as span:
+            span.set_attribute("ranking.job_count", len(jobs))
+            span.set_attribute("ranking.top_k", top_k or -1)
+            logger.info("[RANK] Ranking %d jobs (top_k=%s)", len(jobs), top_k)
+
+            # Ensure profile has embedding
+            if profile.embedding is None:
+                profile = await self.embed_user_profile(profile)
+            
+            # Generate embeddings only for jobs that don't have them
+            jobs_needing_embeddings = [(i, j) for i, j in enumerate(jobs) if j.embedding is None]
+            if jobs_needing_embeddings:
+                indices, jobs_to_embed = zip(*jobs_needing_embeddings)
+                job_texts = [self._job_to_text(job) for job in jobs_to_embed]
+                new_embeddings = await self.embedding_service.embed_batch(job_texts)
+                for idx, embedding in zip(indices, new_embeddings):
+                    jobs[idx].embedding = embedding
+            
+            # Score each job using its embedding
+            ranked_jobs = []
+            for job in jobs:
+                ranked_job = self._score_job(job, job.embedding, profile)
+                ranked_jobs.append(ranked_job)
+            
+            # Sort by score descending
+            ranked_jobs.sort(key=lambda rj: rj.score, reverse=True)
+            
+            # Return top K if specified
+            if top_k is not None:
+                ranked_jobs = ranked_jobs[:top_k]
+            
+            if ranked_jobs:
+                logger.info("[RANK] Top match: %s (%.1f%%)", ranked_jobs[0].job.title, ranked_jobs[0].score * 100)
+            return ranked_jobs
     
     def _job_to_text(self, job: Job) -> str:
         """Convert job to text for embedding."""

@@ -62,6 +62,7 @@ class ResumeParser:
         """Extract text from a PDF file."""
         import fitz  # PyMuPDF
         
+        logger.info("[RESUME] Parsing PDF: %s", file_path)
         doc = fitz.open(file_path)
         text_parts = []
         
@@ -75,6 +76,7 @@ class ResumeParser:
         """Extract text from PDF bytes."""
         import fitz  # PyMuPDF
         
+        logger.info("[RESUME] Parsing PDF from bytes (%d bytes)", len(data))
         doc = fitz.open(stream=data, filetype="pdf")
         text_parts = []
         
@@ -88,6 +90,7 @@ class ResumeParser:
         """Extract text from a DOCX file."""
         from docx import Document
         
+        logger.info("[RESUME] Parsing DOCX: %s", file_path)
         doc = Document(file_path)
         text_parts = []
         
@@ -108,6 +111,7 @@ class ResumeParser:
         """Extract text from DOCX bytes."""
         from docx import Document
         
+        logger.info("[RESUME] Parsing DOCX from bytes (%d bytes)", len(data))
         doc = Document(io.BytesIO(data))
         text_parts = []
         

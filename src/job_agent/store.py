@@ -6,12 +6,15 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import TYPE_CHECKING, Optional
 
+from opentelemetry import trace
+
 from .models import ApplicationPackage, FeedbackType, Job, JobFeedback, JobSearchCriteria, JobStatus, SearchRun, SearchRunStatus, UserProfile
 
 if TYPE_CHECKING:
     from .config import DatabaseConfig
 
 logger = logging.getLogger(__name__)
+_tracer = trace.get_tracer("job_agent.store")
 
 
 class JobStore(ABC):
@@ -124,7 +127,7 @@ class JobStore(ABC):
         """Get a search run by ID."""
         return None
 
-    async def list_search_runs(self, limit: int = 50) -> list[SearchRun]:
+    async def list_search_runs(self, limit: int = 50, *, with_packages_only: bool = False) -> list[SearchRun]:
         """List search runs, most recent first."""
         return []
 
@@ -312,8 +315,10 @@ class InMemoryJobStore(JobStore):
     async def get_search_run(self, run_id: str) -> Optional[SearchRun]:
         return self._search_runs.get(run_id)
 
-    async def list_search_runs(self, limit: int = 50) -> list[SearchRun]:
+    async def list_search_runs(self, limit: int = 50, *, with_packages_only: bool = False) -> list[SearchRun]:
         runs = list(self._search_runs.values())
+        if with_packages_only:
+            runs = [r for r in runs if r.notification_channels]
         runs.sort(key=lambda r: r.created_at, reverse=True)
         return runs[:limit]
 
@@ -497,30 +502,34 @@ class PostgresJobStore(JobStore):
         if not jobs:
             return jobs
         
-        async with self._pool.acquire() as conn:
-            # Use executemany for batch insert
-            await conn.executemany(
-                """
-                INSERT INTO jobs (
-                    id, title, company, location, description, url,
-                    salary_min, salary_max, job_type, experience_level,
-                    skills, source, status, score, posted_at, fetched_at, embedding
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-                ON CONFLICT (id) DO UPDATE SET
-                    title = EXCLUDED.title,
-                    embedding = COALESCE(EXCLUDED.embedding, jobs.embedding),
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                [
-                    (
-                        job.id, job.title, job.company, job.location, job.description,
-                        job.url, job.salary_min, job.salary_max, job.job_type,
-                        job.experience_level, json.dumps(job.skills), job.source,
-                        job.status.value, job.score, job.posted_at, job.fetched_at, job.embedding
-                    )
-                    for job in jobs
-                ]
-            )
+        with _tracer.start_as_current_span("store.add_many") as span:
+            span.set_attribute("store.job_count", len(jobs))
+            logger.info("[STORE] Upserting %d jobs", len(jobs))
+            async with self._pool.acquire() as conn:
+                # Use executemany for batch insert
+                await conn.executemany(
+                    """
+                    INSERT INTO jobs (
+                        id, title, company, location, description, url,
+                        salary_min, salary_max, job_type, experience_level,
+                        skills, source, status, score, posted_at, fetched_at, embedding
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                    ON CONFLICT (id) DO UPDATE SET
+                        title = EXCLUDED.title,
+                        embedding = COALESCE(EXCLUDED.embedding, jobs.embedding),
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    [
+                        (
+                            job.id, job.title, job.company, job.location, job.description,
+                            job.url, job.salary_min, job.salary_max, job.job_type,
+                            job.experience_level, json.dumps(job.skills), job.source,
+                            job.status.value, job.score, job.posted_at, job.fetched_at, job.embedding
+                        )
+                        for job in jobs
+                    ]
+                )
+            logger.info("[STORE] Upserted %d jobs", len(jobs))
         return jobs
     
     async def get(self, job_id: str) -> Optional[Job]:
@@ -535,55 +544,61 @@ class PostgresJobStore(JobStore):
     
     async def search(self, criteria: JobSearchCriteria) -> list[Job]:
         """Search jobs with full-text search and filters."""
-        conditions = []
-        params = []
-        param_idx = 1
-        
-        # Full-text search on title, company, description
-        if criteria.query:
-            # Convert query to tsquery format
-            query_terms = " & ".join(criteria.query.split())
-            conditions.append(
-                f"to_tsvector('english', title || ' ' || company || ' ' || description) "
-                f"@@ to_tsquery('english', ${param_idx})"
-            )
-            params.append(query_terms)
-            param_idx += 1
-        
-        # Location filter (case-insensitive partial match)
-        if criteria.location:
-            conditions.append(f"LOWER(location) LIKE ${param_idx}")
-            params.append(f"%{criteria.location.lower()}%")
-            param_idx += 1
-        
-        # Remote filter
-        if criteria.remote_only:
-            conditions.append(
-                f"(LOWER(job_type) LIKE '%remote%' OR LOWER(location) LIKE '%remote%')"
-            )
-        
-        # Salary filter
-        if criteria.min_salary:
-            conditions.append(
-                f"(salary_max IS NULL OR salary_max >= ${param_idx})"
-            )
-            params.append(criteria.min_salary)
-            param_idx += 1
-        
-        # Build query
-        where_clause = " AND ".join(conditions) if conditions else "TRUE"
-        query = f"""
-            SELECT * FROM jobs
-            WHERE {where_clause}
-            ORDER BY fetched_at DESC
-            LIMIT ${param_idx}
-        """
-        params.append(criteria.max_results)
-        
-        async with self._pool.acquire() as conn:
-            rows = await conn.fetch(query, *params)
-        
-        return [self._row_to_job(row) for row in rows]
+        with _tracer.start_as_current_span("store.search") as span:
+            span.set_attribute("store.query", criteria.query)
+            logger.info("[STORE] Searching jobs: query=%r location=%r", criteria.query, criteria.location)
+            conditions = []
+            params = []
+            param_idx = 1
+            
+            # Full-text search on title, company, description
+            if criteria.query:
+                # Convert query to tsquery format
+                query_terms = " & ".join(criteria.query.split())
+                conditions.append(
+                    f"to_tsvector('english', title || ' ' || company || ' ' || description) "
+                    f"@@ to_tsquery('english', ${param_idx})"
+                )
+                params.append(query_terms)
+                param_idx += 1
+            
+            # Location filter (case-insensitive partial match)
+            if criteria.location:
+                conditions.append(f"LOWER(location) LIKE ${param_idx}")
+                params.append(f"%{criteria.location.lower()}%")
+                param_idx += 1
+            
+            # Remote filter
+            if criteria.remote_only:
+                conditions.append(
+                    f"(LOWER(job_type) LIKE '%remote%' OR LOWER(location) LIKE '%remote%')"
+                )
+            
+            # Salary filter
+            if criteria.min_salary:
+                conditions.append(
+                    f"(salary_max IS NULL OR salary_max >= ${param_idx})"
+                )
+                params.append(criteria.min_salary)
+                param_idx += 1
+            
+            # Build query
+            where_clause = " AND ".join(conditions) if conditions else "TRUE"
+            query = f"""
+                SELECT * FROM jobs
+                WHERE {where_clause}
+                ORDER BY fetched_at DESC
+                LIMIT ${param_idx}
+            """
+            params.append(criteria.max_results)
+            
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(query, *params)
+            
+            results = [self._row_to_job(row) for row in rows]
+            logger.info("[STORE] Search returned %d results", len(results))
+            span.set_attribute("store.result_count", len(results))
+            return results
     
     async def search_by_embedding(
         self, 
@@ -670,40 +685,45 @@ class PostgresJobStore(JobStore):
     # User Profile methods
     async def save_profile(self, profile: UserProfile) -> UserProfile:
         """Save or update a user profile."""
-        async with self._pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO user_profiles (
-                    id, name, email, resume_text, summary, skills,
-                    years_experience, current_title, desired_titles,
-                    preferred_locations, remote_preference, min_salary,
-                    industries, embedding, cron_enabled
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-                ON CONFLICT (id) DO UPDATE SET
-                    name = EXCLUDED.name,
-                    email = EXCLUDED.email,
-                    resume_text = EXCLUDED.resume_text,
-                    summary = EXCLUDED.summary,
-                    skills = EXCLUDED.skills,
-                    years_experience = EXCLUDED.years_experience,
-                    current_title = EXCLUDED.current_title,
-                    desired_titles = EXCLUDED.desired_titles,
-                    preferred_locations = EXCLUDED.preferred_locations,
-                    remote_preference = EXCLUDED.remote_preference,
-                    min_salary = EXCLUDED.min_salary,
-                    industries = EXCLUDED.industries,
-                    embedding = EXCLUDED.embedding,
-                    cron_enabled = EXCLUDED.cron_enabled,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                profile.id, profile.name, profile.email, profile.resume_text,
-                profile.summary, json.dumps(profile.skills), profile.years_experience,
-                profile.current_title, json.dumps(profile.desired_titles),
-                json.dumps(profile.preferred_locations), profile.remote_preference,
-                profile.min_salary, json.dumps(profile.industries), profile.embedding,
-                profile.cron_enabled
-            )
-        return profile
+        with _tracer.start_as_current_span("store.save_profile") as span:
+            span.set_attribute("profile.id", profile.id)
+            span.set_attribute("profile.name", profile.name or "")
+            logger.info("[STORE] Saving profile: %s (id=%s)", profile.name, profile.id[:8])
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO user_profiles (
+                        id, name, email, resume_text, summary, skills,
+                        years_experience, current_title, desired_titles,
+                        preferred_locations, remote_preference, min_salary,
+                        industries, embedding, cron_enabled
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                    ON CONFLICT (id) DO UPDATE SET
+                        name = EXCLUDED.name,
+                        email = EXCLUDED.email,
+                        resume_text = EXCLUDED.resume_text,
+                        summary = EXCLUDED.summary,
+                        skills = EXCLUDED.skills,
+                        years_experience = EXCLUDED.years_experience,
+                        current_title = EXCLUDED.current_title,
+                        desired_titles = EXCLUDED.desired_titles,
+                        preferred_locations = EXCLUDED.preferred_locations,
+                        remote_preference = EXCLUDED.remote_preference,
+                        min_salary = EXCLUDED.min_salary,
+                        industries = EXCLUDED.industries,
+                        embedding = EXCLUDED.embedding,
+                        cron_enabled = EXCLUDED.cron_enabled,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    profile.id, profile.name, profile.email, profile.resume_text,
+                    profile.summary, json.dumps(profile.skills), profile.years_experience,
+                    profile.current_title, json.dumps(profile.desired_titles),
+                    json.dumps(profile.preferred_locations), profile.remote_preference,
+                    profile.min_salary, json.dumps(profile.industries), profile.embedding,
+                    profile.cron_enabled
+                )
+            logger.info("[STORE] Profile saved: %s", profile.name)
+            return profile
     
     async def get_profile(self, profile_id: str) -> Optional[UserProfile]:
         """Get a user profile by ID."""
@@ -803,27 +823,31 @@ class PostgresJobStore(JobStore):
     # Application package methods
     async def save_application_package(self, package: ApplicationPackage) -> ApplicationPackage:
         """Save an application package."""
-        async with self._pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO application_packages (
-                    id, job_id, profile_id, resume_suggestions,
-                    cover_letter, intro_email, recruiters, status, created_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                ON CONFLICT (id) DO UPDATE SET
-                    resume_suggestions = EXCLUDED.resume_suggestions,
-                    cover_letter = EXCLUDED.cover_letter,
-                    intro_email = EXCLUDED.intro_email,
-                    recruiters = EXCLUDED.recruiters,
-                    status = EXCLUDED.status,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                package.id, package.job.id, package.profile.id,
-                json.dumps(package.resume_suggestions), package.cover_letter,
-                package.intro_email, json.dumps(package.recruiters),
-                package.status, package.created_at
-            )
-        return package
+        with _tracer.start_as_current_span("store.save_application_package") as span:
+            span.set_attribute("package.id", package.id)
+            logger.info("[STORE] Saving application package %s", package.id[:8])
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO application_packages (
+                        id, job_id, profile_id, resume_suggestions,
+                        cover_letter, intro_email, recruiters, status, created_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    ON CONFLICT (id) DO UPDATE SET
+                        resume_suggestions = EXCLUDED.resume_suggestions,
+                        cover_letter = EXCLUDED.cover_letter,
+                        intro_email = EXCLUDED.intro_email,
+                        recruiters = EXCLUDED.recruiters,
+                        status = EXCLUDED.status,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    package.id, package.job.id, package.profile.id,
+                    json.dumps(package.resume_suggestions), package.cover_letter,
+                    package.intro_email, json.dumps(package.recruiters),
+                    package.status, package.created_at
+                )
+            logger.info("[STORE] Package saved: %s", package.id[:8])
+            return package
     
     async def get_application_package(self, package_id: str) -> Optional[ApplicationPackage]:
         """Get an application package by ID."""
@@ -1044,13 +1068,28 @@ class PostgresJobStore(JobStore):
             return self._row_to_search_run(row)
         return None
 
-    async def list_search_runs(self, limit: int = 50) -> list[SearchRun]:
-        """List search runs, most recent first."""
+    async def list_search_runs(self, limit: int = 50, *, with_packages_only: bool = False) -> list[SearchRun]:
+        """List search runs, most recent first.
+        
+        Args:
+            limit: Max rows to return.
+            with_packages_only: If True, only return runs that have at least
+                one package (notification_channels is a non-empty JSON array).
+        """
         async with self._pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT * FROM job_search_runs ORDER BY created_at DESC LIMIT $1",
-                limit,
-            )
+            if with_packages_only:
+                rows = await conn.fetch(
+                    "SELECT * FROM job_search_runs "
+                    "WHERE notification_channels IS NOT NULL "
+                    "  AND notification_channels::text != '[]' "
+                    "ORDER BY created_at DESC LIMIT $1",
+                    limit,
+                )
+            else:
+                rows = await conn.fetch(
+                    "SELECT * FROM job_search_runs ORDER BY created_at DESC LIMIT $1",
+                    limit,
+                )
         return [self._row_to_search_run(row) for row in rows]
 
     async def update_search_run(self, run: SearchRun) -> SearchRun:

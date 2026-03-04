@@ -583,7 +583,8 @@
             runs.forEach((r) => {
                 const opt = document.createElement('option');
                 opt.value = r.id;
-                const label = `${r.profile_name || 'run'} — ${new Date(r.created_at).toLocaleString()}`;
+                const pkgCount = r.packages_count || 0;
+                const label = `${r.profile_name || 'run'} — ${pkgCount} pkg${pkgCount !== 1 ? 's' : ''} — ${new Date(r.created_at).toLocaleString()}`;
                 opt.textContent = label;
                 packagesRunSelect.appendChild(opt);
             });

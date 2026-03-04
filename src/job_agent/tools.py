@@ -1,11 +1,23 @@
 """Tools that the coordinator agent can use to search and manage jobs."""
 
+import ipaddress
+import logging
+import re
+import socket
+import time
 from typing import Optional
+from urllib.parse import urlparse
+
+import httpx
+from opentelemetry import trace
 
 from .models import Job, JobSearchCriteria, RankedJob, UserProfile
 from .providers import JobIngestionProvider
 from .ranking import RankingService
 from .store import JobStore
+
+logger = logging.getLogger(__name__)
+_tracer = trace.get_tracer("job_agent.tools")
 
 
 # Global user profile storage (in production, use persistent storage)
@@ -134,7 +146,7 @@ class JobTools:
         elif job.salary_min:
             salary_str = f"${job.salary_min:,}+"
         
-        return {
+        summary = {
             "id": job.id,
             "title": job.title,
             "company": job.company,
@@ -143,6 +155,9 @@ class JobTools:
             "job_type": job.job_type or "Not specified",
             "status": job.status.value,
         }
+        if job.score is not None:
+            summary["match_score"] = round(job.score * 100, 1)
+        return summary
     
     def _job_to_detail(self, job: Job) -> dict:
         """Convert job to full detail dict."""
@@ -164,6 +179,110 @@ class RankingTools:
     def __init__(self, store: JobStore, ranking_service: RankingService):
         self.store = store
         self.ranking_service = ranking_service
+
+    async def fetch_job_description_from_url(self, url: str, timeout: int = 10, max_bytes: int = 512000) -> dict:
+        """
+        Safely fetch a URL and extract visible text for use as a job description.
+
+        Safety measures:
+        - Short timeout (default 10s)
+        - Cap download to `max_bytes` (default 512KB)
+        - Only allow http/https schemes
+        - Block localhost and private IP ranges
+        - Require HTML content-type
+
+        Returns a dict: { 'ok': bool, 'text': str, 'error': str }
+        """
+        start = time.monotonic()
+        logger.info("[FETCH] Attempting URL fetch: %s (timeout=%ds, max_bytes=%d)", url, timeout, max_bytes)
+
+        with _tracer.start_as_current_span("fetch_job_description") as span:
+            span.set_attribute("fetch.url", url)
+            span.set_attribute("fetch.timeout", timeout)
+            span.set_attribute("fetch.max_bytes", max_bytes)
+
+            result = await self._do_fetch(url, timeout, max_bytes)
+
+            elapsed_ms = round((time.monotonic() - start) * 1000)
+            span.set_attribute("fetch.ok", result["ok"])
+            span.set_attribute("fetch.elapsed_ms", elapsed_ms)
+            span.set_attribute("fetch.text_length", len(result.get("text", "")))
+            if result.get("error"):
+                span.set_attribute("fetch.error", result["error"])
+
+            if result["ok"]:
+                logger.info(
+                    "[FETCH] Success: %s — %d chars extracted in %dms",
+                    url, len(result["text"]), elapsed_ms,
+                )
+            else:
+                logger.warning(
+                    "[FETCH] Failed: %s — %s (%dms)",
+                    url, result["error"], elapsed_ms,
+                )
+            return result
+
+    async def _do_fetch(self, url: str, timeout: int, max_bytes: int) -> dict:
+        """Inner implementation of fetch_job_description_from_url."""
+        try:
+            parsed = urlparse(url)
+            if parsed.scheme not in ("http", "https"):
+                return {"ok": False, "text": "", "error": "Unsupported URL scheme"}
+
+            hostname = parsed.hostname or ""
+            # Basic host checks: block localhost and obvious private names
+            if hostname.lower() in ("localhost", "127.0.0.1") or hostname.endswith('.local'):
+                return {"ok": False, "text": "", "error": "Refusing to fetch private or local host"}
+
+            # Resolve and check IPs to avoid SSRF to private ranges
+            try:
+                infos = socket.getaddrinfo(hostname, parsed.port or (443 if parsed.scheme == 'https' else 80))
+                addrs = {info[4][0] for info in infos}
+                for a in addrs:
+                    try:
+                        ip = ipaddress.ip_address(a)
+                        if ip.is_private or ip.is_loopback or ip.is_reserved or ip.is_link_local:
+                            return {"ok": False, "text": "", "error": "Refusing to fetch private or non-routable IP"}
+                    except Exception:
+                        # Non-IP result (unlikely), skip
+                        logger.debug("[FETCH] Non-IP address result for %s: %s", hostname, a)
+                        continue
+            except Exception as dns_exc:
+                # DNS resolution failure -> continue, httpx will surface more details
+                logger.debug("[FETCH] DNS resolution failed for %s: %s", hostname, dns_exc)
+
+            headers = {"User-Agent": "JobAgentFetcher/1.0 (+https://example.local)"}
+            limits = httpx.Limits(max_keepalive_connections=2, max_connections=4)
+            timeout_cfg = httpx.Timeout(timeout)
+            async with httpx.AsyncClient(limits=limits, timeout=timeout_cfg, follow_redirects=True) as client:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code >= 400:
+                    return {"ok": False, "text": "", "error": f"HTTP {resp.status_code}"}
+
+                ct = resp.headers.get("Content-Type", "")
+                if "html" not in ct.lower():
+                    return {"ok": False, "text": "", "error": "URL did not return HTML content"}
+
+                content = resp.content[:max_bytes]
+
+            # Very simple HTML -> text extraction: remove scripts/styles and tags
+            text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", content.decode(errors='ignore'))
+            # Remove tags
+            text = re.sub(r"(?s)<[^>]+>", " ", text)
+            # Collapse whitespace
+            text = re.sub(r"\s+", " ", text).strip()
+
+            if len(text) < 100:
+                return {"ok": False, "text": "", "error": "Fetched page contained too little text"}
+
+            # Heuristic: try to extract the main job-like section by looking for keywords
+            # Split into paragraphs and keep those that mention 'responsibil' or 'require' or 'qualification' or 'skill'
+            paras = [p.strip() for p in re.split(r"\n|\r|\.|\\n", text) if p.strip()]
+            jd_parts = [p for p in paras if re.search(r"responsibil|requirement|qualification|skill|experience|responsible", p, re.I)]
+            extracted = "\n\n".join(jd_parts) if jd_parts else text[:4000]
+            return {"ok": True, "text": extracted, "error": ""}
+        except Exception as exc:
+            return {"ok": False, "text": "", "error": str(exc)}
     
     async def set_user_profile(
         self,
